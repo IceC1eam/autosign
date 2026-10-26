@@ -1,0 +1,18 @@
+{
+  "id": "autosign",
+  "name": "北航签到",
+  "description": "iClass 多账号自动签到与手动签到",
+  "icon": "✅",
+  "color": "#1d4ed8",
+  "version": "2.0.0",
+  "order": 10,
+  "type": "service",
+  "public": false,
+  "service": {
+    "port": 8710,
+    "health": "/healthz",
+    "workdir": "backend",
+    "requirements": "backend/requirements.txt",
+    "command": "uvicorn autosign.main:app --host 127.0.0.1 --port {port} --proxy-headers --forwarded-allow-ips=127.0.0.1 --no-server-header"
+  }
+}

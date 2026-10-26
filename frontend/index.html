@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<meta name="color-scheme" content="light dark">
+<title>iClass 签到</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231d4ed8'/%3E%3Cpath d='M8 17l5 5 11-12' fill='none' stroke='white' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="app">
+
+  <!-- 管理界面 -->
+  <div id="v-main">
+    <header class="top">
+      <h1>iClass 签到</h1>
+      <div class="top-actions">
+        <button id="b-add" class="btn primary small" type="button">＋ 添加账号</button>
+        <a class="btn ghost small back" href="/">‹ 入口</a>
+      </div>
+    </header>
+
+    <p id="empty" class="muted center" hidden>还没有账号。点右上角“添加账号”开始。</p>
+    <ul id="accounts" class="accounts"></ul>
+
+    <section class="card log-card">
+      <h2>最近动态</h2>
+      <ul id="events" class="events"></ul>
+    </section>
+  </div>
+</main>
+
+<!-- 添加 / 编辑账号 -->
+<dialog id="dlg-acc">
+  <form id="f-acc" method="dialog" autocomplete="off">
+    <h3 id="acc-title">添加账号</h3>
+    <label>备注名（可选）
+      <input id="acc-label" maxlength="40">
+    </label>
+    <label>学号
+      <input id="acc-number" inputmode="numeric" maxlength="20" required>
+    </label>
+    <label>统一认证密码 <span id="acc-pw-hint" class="hint"></span>
+      <input id="acc-pw" type="password" autocomplete="new-password">
+    </label>
+    <label id="acc-enable-row" class="check">
+      <input id="acc-enabled" type="checkbox">
+      <span>添加后立即开启自动签到</span>
+    </label>
+    <div class="row">
+      <button class="btn ghost" type="button" id="acc-cancel">取消</button>
+      <button class="btn primary" type="submit" id="acc-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 课表 / 手动签到 -->
+<dialog id="dlg-sched" class="wide">
+  <div class="sched-head">
+    <h3 id="sched-title">课表</h3>
+    <button id="sched-close" class="btn ghost small" type="button">关闭</button>
+  </div>
+  <div class="datebar">
+    <button id="d-prev" class="btn ghost icon" type="button" aria-label="前一天">‹</button>
+    <button id="d-today" class="date-label" type="button" title="回到今天"></button>
+    <button id="d-next" class="btn ghost icon" type="button" aria-label="后一天">›</button>
+    <button id="d-refresh" class="btn ghost icon" type="button" aria-label="刷新">↻</button>
+  </div>
+  <ul id="lessons" class="lessons"></ul>
+  <p id="sched-empty" class="muted center" hidden>这一天没有课程安排。</p>
+  <p id="sched-err" class="err" hidden></p>
+</dialog>
+
+<!-- 通用确认 -->
+<dialog id="dlg">
+  <form method="dialog">
+    <h3 id="dlg-title">确认</h3>
+    <p id="dlg-text"></p>
+    <div class="row">
+      <button class="btn ghost" value="cancel">取消</button>
+      <button id="dlg-ok" class="btn primary" value="ok">确定</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>
