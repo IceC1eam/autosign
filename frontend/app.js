@@ -5,7 +5,7 @@
   const STATUS = { signed: "已签到", pending: "待签", failed: "失败", unknown: "未知" };
   let timer = null;
   let editing = null;     // 正在编辑的账号 id（null 表示添加）
-  let sched = { id: null, day: null, label: "", busy: false, mode: "day" };
+  let sched = { id: null, day: null, label: "", seq: 0, mode: "day" };
   let accountsCache = [];
 
   const el = (tag, cls, text) => {
@@ -232,7 +232,7 @@
 
   // ---------- 课表 / 手动签到 ----------
   function openSchedule(a) {
-    sched = { id: a.id, day: chinaToday(), label: a.label, busy: false, mode: sched.mode };
+    sched = { id: a.id, day: chinaToday(), label: a.label, seq: sched.seq + 1, mode: sched.mode };
     setModeUi(sched.mode);
     $("sched-title").textContent = `${a.label} · 课表`;
     $("dlg-sched").showModal();
@@ -259,25 +259,19 @@
     return li;
   }
 
-  // 周视图：一周内每天的课程、签到状态与计划签到时刻
-  function weekLesson(l, day) {
-    const li = el("li", "wl");
-    const r1 = el("div", "row1");
-    r1.append(el("span", "time", `${isoHM(l.start)}–${isoHM(l.end)}`), el("span", "name", l.name),
-      el("span", "badge " + l.state, { signed: "已签到", unsigned: "未签到", unknown: "状态未知" }[l.state]));
-    li.append(r1);
+  // 周视图：常见的课表网格——列是星期，行是上课时段，格子里是课程
+  const WEEK_SHORT = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+  const STATE_TXT = { signed: "已签到", unsigned: "未签到", unknown: "状态未知" };
+
+  function lessonCell(l, day) {
+    const b = el("button", "cell " + l.state);
+    b.type = "button";
+    b.append(el("span", "cn", l.name));
     const meta = [l.teacher, l.room].filter(Boolean).join(" · ");
-    if (meta) li.append(el("div", "meta", meta));
-    const notes = [];
-    if (l.planned_at) notes.push(`计划 ${hms(l.planned_at)} 签到`);
-    if (l.same_slot > 1) notes.push(`同名同时段共 ${l.same_slot} 个班，共用同一签到时刻`);
-    if (notes.length) li.append(el("div", "hint", notes.join(" · ")));
-    if (l.can_sign) {
-      const b = el("button", "btn primary", "签到");
-      b.type = "button"; b.addEventListener("click", () => manualSign(l, day));
-      li.append(b);
-    }
-    return li;
+    if (meta) b.append(el("span", "cm", meta));
+    b.append(el("span", "cs", STATE_TXT[l.state]));
+    b.addEventListener("click", () => openLesson(l, day));
+    return b;
   }
 
   function renderWeek(res) {
@@ -285,21 +279,69 @@
     $("week-sum").textContent = `本周共 ${s.total} 节 · 已签 ${s.signed} · 未签 ${s.unsigned}` +
       (s.unknown ? ` · 状态未知 ${s.unknown}` : "");
     show("week-sum", true);
-    $("week").replaceChildren(...res.days.map((d) => {
-      const sec = el("section", "wday" + (d.date === chinaToday() ? " today" : ""));
-      const h = el("h4", null, dayLabel(d.date));
-      h.append(el("span", "cnt", d.lessons.length ? `${d.lessons.length} 节` : "无课"));
-      sec.append(h);
-      if (d.lessons.length) {
-        const ul = el("ul", "wlist");
-        d.lessons.forEach((l) => ul.append(weekLesson(l, d.date)));
-        sec.append(ul);
-      }
-      return sec;
+    const wk = $("week");
+    if (!s.total) { wk.replaceChildren(); show("sched-empty", true); $("sched-empty").textContent = "这一周没有课程安排。"; return; }
+    show("sched-empty", false);
+
+    // 周末没课就不占列
+    const days = res.days.filter((d, i) => i < 5 || d.lessons.length);
+    // 行 = 本周出现过的不同上课时段（按开始时间排序），不写死学校的节次表
+    const slots = new Map();
+    days.forEach((d) => d.lessons.forEach((l) => {
+      const k = `${isoHM(l.start)}-${isoHM(l.end)}`;
+      if (!slots.has(k)) slots.set(k, [isoHM(l.start), isoHM(l.end)]);
     }));
+    const rows = [...slots.entries()].sort((x, y) => x[1][0].localeCompare(y[1][0]) || x[1][1].localeCompare(y[1][1]));
+
+    const grid = el("div", "cal");
+    grid.style.setProperty("--cols", days.length);
+    grid.append(el("div", "ch corner"));
+    days.forEach((d) => {
+      const [, m, dd] = d.date.split("-");
+      const h = el("div", "ch" + (d.date === chinaToday() ? " today" : ""));
+      h.append(el("b", null, WEEK_SHORT[new Date(d.date + "T00:00:00Z").getUTCDay()]), el("span", null, `${+m}/${+dd}`));
+      grid.append(h);
+    });
+    rows.forEach(([k, [st, en]]) => {
+      const t = el("div", "ct");
+      t.append(el("b", null, st), el("span", null, en));
+      grid.append(t);
+      days.forEach((d) => {
+        const c = el("div", "cc" + (d.date === chinaToday() ? " today" : ""));
+        d.lessons.filter((l) => `${isoHM(l.start)}-${isoHM(l.end)}` === k).forEach((l) => c.append(lessonCell(l, d.date)));
+        grid.append(c);
+      });
+    });
+    wk.replaceChildren(grid);
   }
 
+  // 点课程格子：详情（教师、教室、签到状态、计划时刻），可签时提供签到
+  let lessonCtx = null;
+  function openLesson(l, day) {
+    lessonCtx = { l, day };
+    $("ls-name").textContent = l.name;
+    const rows = [
+      ["日期", dayLabel(day)],
+      ["时间", `${isoHM(l.start)}–${isoHM(l.end)}`],
+      ["教师", l.teacher || "—"],
+      ["教室", l.room || "—"],
+      ["状态", STATE_TXT[l.state]],
+    ];
+    if (l.planned_at) rows.push(["计划签到", hms(l.planned_at)]);
+    if (l.same_slot > 1) rows.push(["同时段", `同名共 ${l.same_slot} 个班，共用同一签到时刻`]);
+    $("ls-info").replaceChildren(...rows.flatMap(([k, v]) => [el("dt", null, k), el("dd", null, v)]));
+    show("ls-sign", l.can_sign);
+    $("dlg-lesson").showModal();
+  }
+  $("ls-close").addEventListener("click", () => $("dlg-lesson").close());
+  $("ls-sign").addEventListener("click", () => {
+    const c = lessonCtx;
+    $("dlg-lesson").close();
+    if (c) manualSign(c.l, c.day);
+  });
+
   function setModeUi(mode) {
+    $("dlg-sched").classList.toggle("weekmode", mode === "week");
     $("m-day").setAttribute("aria-pressed", String(mode === "day"));
     $("m-week").setAttribute("aria-pressed", String(mode === "week"));
     $("d-prev").setAttribute("aria-label", mode === "week" ? "上一周" : "前一天");
@@ -312,8 +354,7 @@
   }
 
   async function loadSchedule() {
-    if (sched.busy) return;
-    sched.busy = true;
+    const my = ++sched.seq;   // 切换视图/翻页时以最后一次请求为准，丢弃过期响应
     const week = sched.mode === "week";
     $("d-today").textContent = week ? weekLabel(sched.day) : dayLabel(sched.day);
     show("sched-err", false);
@@ -322,17 +363,21 @@
     try {
       if (week) {
         show("sched-empty", false);
-        renderWeek(await api(`/api/accounts/${sched.id}/week?date=${sched.day}`));
+        const res = await api(`/api/accounts/${sched.id}/week?date=${sched.day}`);
+        if (my === sched.seq) renderWeek(res);
         return;
       }
       const res = await api(`/api/accounts/${sched.id}/schedule?date=${sched.day}`);
+      if (my !== sched.seq) return;
       $("lessons").replaceChildren(...res.lessons.map(lessonItem));
+      $("sched-empty").textContent = "这一天没有课程安排。";
       show("sched-empty", res.lessons.length === 0);
     } catch (e) {
+      if (my !== sched.seq) return;
       $("lessons").replaceChildren(); $("week").replaceChildren(); show("week-sum", false); show("sched-empty", false);
       $("sched-err").textContent = e.message + (e.trace ? "\n" + e.trace.join("\n") : "");
       show("sched-err", true);
-    } finally { sched.busy = false; }
+    }
   }
 
   async function manualSign(l, day) {
