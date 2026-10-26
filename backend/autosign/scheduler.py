@@ -2,6 +2,7 @@
 
 规则：
 - 账号处于“开”时，在每节未签到课程开始前 10 分钟的窗口内随机挑一个时刻签到；
+  同一时间、同名的课程（只是教师不同）取同一个随机时刻；
 - 账号由“关”切到“开”时，立即检查并签到当前已可签、且未签到的课程；
 - 签到 POST 只发一次（Client.sign 内部保证），响应不明确时只回查，不重放；
 - 账号密码错误/需要验证码时暂停该账号，避免反复失败登录触发学校风控。
@@ -168,6 +169,7 @@ class Manager:
         now = time.time()
         day = today.isoformat()
         pending = signed = 0
+        slot_time: dict[tuple[str, float], float] = {}   # 同名同时段 -> 共用的计划时刻
         for L in lessons:
             st, en = L.start.timestamp(), L.end.timestamp()
             row = db.one("SELECT * FROM plans WHERE account_id=? AND day=? AND lesson_id=?",
@@ -192,8 +194,7 @@ class Manager:
                 continue  # 课程已结束，不再安排
             pending += 1
             if row is None or (row["status"] == "pending" and abs(row["start_ts"] - st) > 1):
-                planned = max(st - WINDOW_LEAD + 2 + random.random() * (WINDOW_LEAD - 3),
-                              now + 1 + random.random() * 19)
+                planned = self._slot_time(aid, day, L, now, slot_time)
                 db.x("INSERT OR REPLACE INTO plans VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                      (aid, day, L.id, L.name, st, en, planned, "pending", 0,
                       f"计划 {hms(planned)} 签到", now))
@@ -221,6 +222,22 @@ class Manager:
             r.next_poll = now + 1800
         db.x("UPDATE accounts SET state='ok',state_msg=?,state_at=? WHERE id=?",
              (f"{hms(now)} 已检查：今日 {len(lessons)} 节，已签 {signed}，待签 {pending}", now, aid))
+
+    @staticmethod
+    def _slot_time(aid: int, day: str, L, now: float, slot_time: dict) -> float:
+        """同一时间、同名的课程只是教师不同，取同一个随机时刻：先复用已有计划，再复用本轮已定的，最后才新随机。"""
+        if L.slot not in slot_time:
+            st = L.start.timestamp()
+            for r in db.q("SELECT name,planned_at FROM plans WHERE account_id=? AND day=? AND status='pending' "
+                          "AND attempts=0 AND ABS(start_ts-?)<=1 AND lesson_id<>? ORDER BY planned_at",
+                          (aid, day, st, L.id)):
+                if " ".join(r["name"].split()) == L.slot[0]:
+                    slot_time[L.slot] = max(r["planned_at"], now + 1)
+                    break
+            else:
+                slot_time[L.slot] = max(st - WINDOW_LEAD + 2 + random.random() * (WINDOW_LEAD - 3),
+                                        now + 1 + random.random() * 19)
+        return slot_time[L.slot]
 
     # ---------- 执行到点的签到 ----------
     def _attempt_due(self, acc, r: Runner):
@@ -284,6 +301,13 @@ class Manager:
                  ("手动签到成功", time.time(), aid, day.isoformat(), lesson_id))
         db.event(aid, "sign", f"手动签到：{res.status} {res.message}")
         return res
+
+    def week(self, aid: int, days: list[date]):
+        """整周课表：沿用已有会话依次查询每天（只读），返回 [(日期, 课程列表)]。"""
+        acc = db.one("SELECT * FROM accounts WHERE id=?", (aid,))
+        if not acc:
+            raise ClientError("input", "账号不存在")
+        return self.call(acc, self.runner(aid), lambda c: [(d, c.schedules(d)) for d in days], True)
 
     def schedule(self, aid: int, day: date):
         acc = db.one("SELECT * FROM accounts WHERE id=?", (aid,))

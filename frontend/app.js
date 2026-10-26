@@ -5,7 +5,7 @@
   const STATUS = { signed: "已签到", pending: "待签", failed: "失败", unknown: "未知" };
   let timer = null;
   let editing = null;     // 正在编辑的账号 id（null 表示添加）
-  let sched = { id: null, day: null, label: "", busy: false };
+  let sched = { id: null, day: null, label: "", busy: false, mode: "day" };
   let accountsCache = [];
 
   const el = (tag, cls, text) => {
@@ -55,6 +55,15 @@
     const t = new Date(d + "T00:00:00Z");
     t.setUTCDate(t.getUTCDate() + n);
     return t.toISOString().slice(0, 10);
+  }
+  function weekStart(d) {   // 该日所在周的周一
+    const t = new Date(d + "T00:00:00Z");
+    return shift(d, -((t.getUTCDay() + 6) % 7));
+  }
+  function weekLabel(d) {
+    const a = weekStart(d), b = shift(a, 6);
+    const md = (x) => `${+x.split("-")[1]} 月 ${+x.split("-")[2]} 日`;
+    return `${md(a)} – ${md(b)}` + (weekStart(chinaToday()) === a ? "（本周）" : "");
   }
   function dayLabel(d) {
     const t = new Date(d + "T00:00:00Z");
@@ -223,7 +232,8 @@
 
   // ---------- 课表 / 手动签到 ----------
   function openSchedule(a) {
-    sched = { id: a.id, day: chinaToday(), label: a.label, busy: false };
+    sched = { id: a.id, day: chinaToday(), label: a.label, busy: false, mode: sched.mode };
+    setModeUi(sched.mode);
     $("sched-title").textContent = `${a.label} · 课表`;
     $("dlg-sched").showModal();
     loadSchedule();
@@ -249,26 +259,87 @@
     return li;
   }
 
+  // 周视图：一周内每天的课程、签到状态与计划签到时刻
+  function weekLesson(l, day) {
+    const li = el("li", "wl");
+    const r1 = el("div", "row1");
+    r1.append(el("span", "time", `${isoHM(l.start)}–${isoHM(l.end)}`), el("span", "name", l.name),
+      el("span", "badge " + l.state, { signed: "已签到", unsigned: "未签到", unknown: "状态未知" }[l.state]));
+    li.append(r1);
+    const meta = [l.teacher, l.room].filter(Boolean).join(" · ");
+    if (meta) li.append(el("div", "meta", meta));
+    const notes = [];
+    if (l.planned_at) notes.push(`计划 ${hms(l.planned_at)} 签到`);
+    if (l.same_slot > 1) notes.push(`同名同时段共 ${l.same_slot} 个班，共用同一签到时刻`);
+    if (notes.length) li.append(el("div", "hint", notes.join(" · ")));
+    if (l.can_sign) {
+      const b = el("button", "btn primary", "签到");
+      b.type = "button"; b.addEventListener("click", () => manualSign(l, day));
+      li.append(b);
+    }
+    return li;
+  }
+
+  function renderWeek(res) {
+    const s = res.summary;
+    $("week-sum").textContent = `本周共 ${s.total} 节 · 已签 ${s.signed} · 未签 ${s.unsigned}` +
+      (s.unknown ? ` · 状态未知 ${s.unknown}` : "");
+    show("week-sum", true);
+    $("week").replaceChildren(...res.days.map((d) => {
+      const sec = el("section", "wday" + (d.date === chinaToday() ? " today" : ""));
+      const h = el("h4", null, dayLabel(d.date));
+      h.append(el("span", "cnt", d.lessons.length ? `${d.lessons.length} 节` : "无课"));
+      sec.append(h);
+      if (d.lessons.length) {
+        const ul = el("ul", "wlist");
+        d.lessons.forEach((l) => ul.append(weekLesson(l, d.date)));
+        sec.append(ul);
+      }
+      return sec;
+    }));
+  }
+
+  function setModeUi(mode) {
+    $("m-day").setAttribute("aria-pressed", String(mode === "day"));
+    $("m-week").setAttribute("aria-pressed", String(mode === "week"));
+    $("d-prev").setAttribute("aria-label", mode === "week" ? "上一周" : "前一天");
+    $("d-next").setAttribute("aria-label", mode === "week" ? "下一周" : "后一天");
+  }
+  function setMode(mode) {
+    sched.mode = mode;
+    setModeUi(mode);
+    loadSchedule();
+  }
+
   async function loadSchedule() {
     if (sched.busy) return;
     sched.busy = true;
-    $("d-today").textContent = dayLabel(sched.day);
+    const week = sched.mode === "week";
+    $("d-today").textContent = week ? weekLabel(sched.day) : dayLabel(sched.day);
     show("sched-err", false);
+    show("lessons", !week); show("week", week);
+    if (!week) show("week-sum", false);
     try {
+      if (week) {
+        show("sched-empty", false);
+        renderWeek(await api(`/api/accounts/${sched.id}/week?date=${sched.day}`));
+        return;
+      }
       const res = await api(`/api/accounts/${sched.id}/schedule?date=${sched.day}`);
       $("lessons").replaceChildren(...res.lessons.map(lessonItem));
       show("sched-empty", res.lessons.length === 0);
     } catch (e) {
-      $("lessons").replaceChildren(); show("sched-empty", false);
+      $("lessons").replaceChildren(); $("week").replaceChildren(); show("week-sum", false); show("sched-empty", false);
       $("sched-err").textContent = e.message + (e.trace ? "\n" + e.trace.join("\n") : "");
       show("sched-err", true);
     } finally { sched.busy = false; }
   }
 
-  async function manualSign(l) {
+  async function manualSign(l, day) {
+    day = day || sched.day;
     if (!await confirmBox("确认签到", `${sched.label}：${l.name}（${isoHM(l.start)}–${isoHM(l.end)}）将提交一次签到。`, "签到")) return;
     try {
-      const r = await api(`/api/accounts/${sched.id}/sign`, { method: "POST", body: { date: sched.day, id: l.id } });
+      const r = await api(`/api/accounts/${sched.id}/sign`, { method: "POST", body: { date: day, id: l.id } });
       toast(r.message, r.status !== "success");
     } catch (e) { toast(e.message, true); }
     await loadSchedule();
@@ -276,8 +347,11 @@
   }
 
   $("sched-close").addEventListener("click", () => $("dlg-sched").close());
-  $("d-prev").addEventListener("click", () => { sched.day = shift(sched.day, -1); loadSchedule(); });
-  $("d-next").addEventListener("click", () => { sched.day = shift(sched.day, 1); loadSchedule(); });
+  const step = () => (sched.mode === "week" ? 7 : 1);
+  $("d-prev").addEventListener("click", () => { sched.day = shift(sched.day, -step()); loadSchedule(); });
+  $("d-next").addEventListener("click", () => { sched.day = shift(sched.day, step()); loadSchedule(); });
+  $("m-day").addEventListener("click", () => { if (sched.mode !== "day") setMode("day"); });
+  $("m-week").addEventListener("click", () => { if (sched.mode !== "week") setMode("week"); });
   $("d-today").addEventListener("click", () => { sched.day = chinaToday(); loadSchedule(); });
   $("d-refresh").addEventListener("click", loadSchedule);
 

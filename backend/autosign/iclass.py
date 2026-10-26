@@ -55,6 +55,11 @@ class Lesson:
     end: datetime
     sign_status: int | None  # 0 未签到 / 1 已签到 / None 未知
 
+    @property
+    def slot(self) -> tuple[str, float]:
+        """同名同时段的课程（仅教师/教室不同）视为同一节课，共用同一个签到时刻。"""
+        return " ".join(self.name.split()), self.start.timestamp()
+
     def window_open(self, now: datetime) -> bool:
         return self.start - timedelta(minutes=10) <= now <= self.end
 

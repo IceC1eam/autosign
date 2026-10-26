@@ -62,13 +62,19 @@
     <h3 id="sched-title">课表</h3>
     <button id="sched-close" class="btn ghost small" type="button">关闭</button>
   </div>
+  <div class="seg" role="group" aria-label="课表视图">
+    <button id="m-day" type="button" aria-pressed="true">日</button>
+    <button id="m-week" type="button" aria-pressed="false">周</button>
+  </div>
   <div class="datebar">
     <button id="d-prev" class="btn ghost icon" type="button" aria-label="前一天">‹</button>
     <button id="d-today" class="date-label" type="button" title="回到今天"></button>
     <button id="d-next" class="btn ghost icon" type="button" aria-label="后一天">›</button>
     <button id="d-refresh" class="btn ghost icon" type="button" aria-label="刷新">↻</button>
   </div>
+  <p id="week-sum" class="muted" hidden></p>
   <ul id="lessons" class="lessons"></ul>
+  <div id="week" class="week" hidden></div>
   <p id="sched-empty" class="muted center" hidden>这一天没有课程安排。</p>
   <p id="sched-err" class="err" hidden></p>
 </dialog>

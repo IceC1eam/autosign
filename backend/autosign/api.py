@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import date as Date
+from collections import Counter
+from datetime import date as Date, timedelta
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -151,6 +152,34 @@ def schedule(aid: int, date: Date | None = None):
     lessons = manager.schedule(aid, day)
     now = now_china()
     return {"date": day.isoformat(), "lessons": [x.to_dict(now) for x in lessons]}
+
+
+@router.get("/accounts/{aid}/week")
+def week(aid: int, date: Date | None = None):
+    """周一至周日的完整课表（含签到状态、计划签到时刻）。"""
+    _get(aid)
+    anchor = date or now_china().date()
+    monday = anchor - timedelta(days=anchor.weekday())
+    by_day = manager.week(aid, [monday + timedelta(days=i) for i in range(7)])
+    now = now_china()
+    plans = {(r["day"], r["lesson_id"]): r for r in db.q(
+        "SELECT day,lesson_id,planned_at,status FROM plans WHERE account_id=? AND day BETWEEN ? AND ?",
+        (aid, monday.isoformat(), (monday + timedelta(days=6)).isoformat()))}
+    days, total = [], Counter()
+    for d, lessons in by_day:
+        slots = Counter(x.slot for x in lessons)
+        items = []
+        for x in lessons:
+            item = x.to_dict(now)
+            p = plans.get((d.isoformat(), x.id))
+            item["planned_at"] = p["planned_at"] if p and p["status"] == "pending" else None
+            item["same_slot"] = slots[x.slot]   # >1：同名同时段的多个教师班，共用同一个签到时刻
+            items.append(item)
+            total[item["state"]] += 1
+        days.append({"date": d.isoformat(), "lessons": items})
+    return {"start": monday.isoformat(), "end": (monday + timedelta(days=6)).isoformat(), "days": days,
+            "summary": {"total": sum(total.values()), "signed": total["signed"],
+                        "unsigned": total["unsigned"], "unknown": total["unknown"]}}
 
 
 @router.post("/accounts/{aid}/sign")

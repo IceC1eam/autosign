@@ -38,6 +38,35 @@ class ApiTests(unittest.TestCase):
         r = self.c.get("/api/accounts/999/schedule")
         self.assertEqual((r.status_code, r.json()["error"]["kind"]), (404, "http"))
 
+    def test_week_schedule(self):
+        from datetime import date, datetime, timedelta
+
+        from autosign import iclass
+        from autosign.scheduler import manager
+
+        aid = self.c.post("/api/accounts", json={"number": "20370001", "password": "pw"}).json()["id"]
+        t = datetime(2026, 10, 21, 8, 0, tzinfo=iclass.CHINA)   # 周三
+        mk = lambda lid, teacher, st: iclass.Lesson(lid, "高等数学", teacher, "主楼", t, t + timedelta(minutes=95), st)
+        seen = []
+
+        def fake_week(_aid, days):
+            seen.extend(days)
+            return [(d, [mk("a", "甲", 1), mk("b", "乙", 0)] if d == date(2026, 10, 21) else []) for d in days]
+
+        orig, manager.week = manager.week, fake_week
+        try:
+            r = self.c.get(f"/api/accounts/{aid}/week?date=2026-10-23")   # 周五 -> 所在周周一为 10-19
+        finally:
+            manager.week = orig
+        self.assertEqual(r.status_code, 200, r.text)
+        j = r.json()
+        self.assertEqual((j["start"], j["end"]), ("2026-10-19", "2026-10-25"))
+        self.assertEqual(len(seen), 7)
+        wed = j["days"][2]
+        self.assertEqual(wed["date"], "2026-10-21")
+        self.assertEqual([x["same_slot"] for x in wed["lessons"]], [2, 2])
+        self.assertEqual(j["summary"], {"total": 2, "signed": 1, "unsigned": 1, "unknown": 0})
+
     def test_frontend_uses_relative_api_paths(self):
         # 应用挂在 /<id>/ 下，前端若用绝对 /api/... 会打到入口而不是本应用
         from pathlib import Path

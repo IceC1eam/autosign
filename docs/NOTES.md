@@ -6,13 +6,13 @@
 - 日志：`journalctl -u app-autosign`；审计 `tail /var/lib/apps/autosign/audit.log`；页面底部“最近动态”来自 `events` 表
 - 测试：`cd apps/autosign/backend && python -m unittest discover -s tests -t .`
 - 每次对某账号做登录/取课表都是一次**真实的**统一认证登录，不要在循环里反复调用。密码错误/验证码会让账号进入 `auth_failed`/`captcha` 暂停态，需在界面里修改密码或重新开关后恢复。
-- 主要接口（均在 `/autosign/api/` 下，需已登录平台）：`GET|POST /accounts`、`PATCH|DELETE /accounts/{id}`、`POST /accounts/{id}/check`、`GET /accounts/{id}/schedule?date=`、`POST /accounts/{id}/sign`、`GET /events`
+- 主要接口（均在 `/autosign/api/` 下，需已登录平台）：`GET|POST /accounts`、`PATCH|DELETE /accounts/{id}`、`POST /accounts/{id}/check`、`GET /accounts/{id}/schedule?date=`、`GET /accounts/{id}/week?date=`（该日所在周一至周日，含签到状态与计划时刻；7 次只读课表查询复用已有会话）、`POST /accounts/{id}/sign`、`GET /events`
 
 ## 关键行为与不变量（改代码前必读）
 
 1. **签到 POST 只发一次**。响应丢失/异常/不明确 → 只回查课表（`Client._confirm`），不得重放。读取接口仅对连接类故障最多重试 3 次。
 2. **HTML/重定向 = 会话失效**，不是“今天没课”。只读调用可自动重登一次；签到不会因会话失效而重发。
-3. **调度规则**：账号开启时，每节未签到课程在“课前 10 分钟 → 开课”窗口内随机一个时刻签到（`planned_at` 落库）；账号由关切到开（`kick(force=True)`）时，立即检查，窗口已开（开课前 10 分钟至下课）且未签的课程立即签；已结束的课不安排；`signStatus` 非 0/1 视为未知，不自动提交。
+3. **调度规则**：账号开启时，每节未签到课程在“课前 10 分钟 → 开课”窗口内随机一个时刻签到（`planned_at` 落库）；账号由关切到开（`kick(force=True)`）时，立即检查，窗口已开（开课前 10 分钟至下课）且未签的课程立即签；已结束的课不安排；`signStatus` 非 0/1 视为未知，不自动提交。**同名同时段**（`Lesson.slot`：名称去多余空白 + 开课时间相同，只是教师/教室不同的多个班）共用同一个随机时刻（`Manager._slot_time`：优先复用已有 pending 计划，其次本轮已定的，最后才新随机）。
 4. **登录失败暂停**：`auth`（密码错误）/`captcha` → 账号状态置 `auth_failed`/`captcha`，调度器不再重试，避免触发学校风控。其余错误 5 分钟后重试。
 5. **访问控制不在本应用**：登录、会话、防爆破、CSRF 由平台网关（portal + nginx `auth_request`）负责，见仓库 `docs/ARCHITECTURE.md`。本应用只监听 127.0.0.1。
 6. **敏感信息**：北航密码只以 Fernet 密文入库，接口永不返回；日志/事件/轨迹不得包含密码、ticket、token、sessionId、完整 URL 查询值（`webvpn.describe()` 只保留参数名）。

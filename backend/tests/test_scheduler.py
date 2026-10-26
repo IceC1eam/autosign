@@ -40,10 +40,10 @@ class FakeClient:
         return SignResult("success", "签到成功")
 
 
-def lesson(lid, start_in_min, dur=95, signed=0):
+def lesson(lid, start_in_min, dur=95, signed=0, name=None, teacher="师"):
     now = iclass.now_china()
     s = now + timedelta(minutes=start_in_min)
-    return Lesson(lid, "课" + lid, "师", "室", s, s + timedelta(minutes=dur), signed)
+    return Lesson(lid, name or "课" + lid, teacher, "室", s, s + timedelta(minutes=dur), signed)
 
 
 class SchedulerTests(unittest.TestCase):
@@ -116,6 +116,32 @@ class SchedulerTests(unittest.TestCase):
         # tick 不会再去重试已暂停的账号
         self.m.pool.submit = lambda *a, **k: self.fail("paused account must not be retried")
         self.m.tick()
+
+    def test_same_name_same_time_shares_planned_time(self):
+        # 同名同时段、教师不同：共用同一个随机时刻；同时段不同名、同名不同时段则各自随机
+        base = lesson("1", 120, name="高等数学", teacher="甲")
+        twin = lesson("2", 120, name="高等数学", teacher="乙")
+        twin.start, twin.end = base.start, base.end
+        other = lesson("3", 120, name="大学物理")
+        other.start, other.end = base.start, base.end
+        later = lesson("4", 300, name="高等数学")
+        FakeClient.lessons = {"1": base, "2": twin, "3": other, "4": later}
+        for _ in range(3):
+            self.run_job()
+        p1, p2, p3, p4 = (self.plan(i) for i in "1234")
+        self.assertEqual(p1["planned_at"], p2["planned_at"])
+        self.assertNotEqual(p1["planned_at"], p3["planned_at"])
+        self.assertNotEqual(p1["planned_at"], p4["planned_at"])
+
+    def test_late_sibling_reuses_existing_planned_time(self):
+        first = lesson("1", 120, name="高等数学", teacher="甲")
+        FakeClient.lessons = {"1": first}
+        self.run_job()
+        twin = lesson("2", 120, name="高等数学", teacher="乙")
+        twin.start, twin.end = first.start, first.end
+        FakeClient.lessons["2"] = twin
+        self.run_job(force=True)   # 课表中途多出同名同时段的班级
+        self.assertEqual(self.plan("1")["planned_at"], self.plan("2")["planned_at"])
 
     def test_ended_lesson_not_planned(self):
         FakeClient.lessons = {"1": lesson("1", -200)}

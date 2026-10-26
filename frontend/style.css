@@ -136,6 +136,23 @@ dialog .btn.primary { width: auto; }
 .events li.error .m { color: var(--bad); }
 .events li.trace .m { color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
 
+.seg { display: inline-flex; margin-bottom: 10px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.seg button { font: inherit; font-size: 14px; font-weight: 600; min-height: 34px; padding: 4px 18px; border: 0; cursor: pointer; background: transparent; color: var(--muted); }
+.seg button[aria-pressed=true] { background: var(--accent); color: var(--accent-ink); }
+
+.week { display: grid; gap: 12px; }
+.wday { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 10px 14px; }
+.wday.today { border-color: var(--accent); }
+.wday h4 { margin: 0; display: flex; justify-content: space-between; align-items: baseline; font-size: 15px; }
+.wday .cnt { font-size: 13px; font-weight: 400; color: var(--muted); }
+.wlist { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px; }
+.wl { display: grid; gap: 3px; padding: 8px 10px; background: var(--bg); border-radius: 10px; }
+.wl .row1 { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.wl .time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; }
+.wl .name { font-weight: 650; flex: 1; min-width: 6em; overflow-wrap: anywhere; }
+.wl .meta { color: var(--muted); font-size: 13px; }
+.wl .btn.primary { width: auto; justify-self: start; min-height: 36px; padding: 4px 16px; }
+
 dialog.wide { max-width: 560px; max-height: 88vh; overflow: auto; }
 .sched-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .err { color: var(--bad); font-size: 13px; overflow-wrap: anywhere; white-space: pre-wrap; }
