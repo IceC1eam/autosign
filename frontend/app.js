@@ -124,7 +124,7 @@
 
     const bad = a.state === "auth_failed" || a.state === "captcha" || a.state === "error";
     let stateText = a.enabled ? (a.state_msg || "等待首次检查…") : "自动签到已关闭";
-    if (a.state === "auth_failed") stateText = "已暂停：" + a.state_msg + "（修改密码后重新开启）";
+    if (a.state === "auth_failed") stateText = "已暂停：" + a.state_msg + "（修改密码后重新开启，或点“验证码登录”）";
     if (a.state === "captcha") stateText = "已暂停：" + a.state_msg;
     li.append(el("p", "acc-state" + (a.enabled && bad ? " bad" : ""), stateText));
 
@@ -139,6 +139,7 @@
       const b = el("button", "btn ghost" + (cls ? " " + cls : ""), text);
       b.type = "button"; b.addEventListener("click", fn); return b;
     };
+    if (a.state === "captcha" || a.state === "auth_failed") act.append(mk("验证码登录", () => openCaptcha(a), "accent"));
     act.append(mk("课表 / 手动签到", () => openSchedule(a)));
     if (a.enabled) act.append(mk("立即检查", () => checkNow(a)));
     act.append(mk("编辑", () => openEdit(a)), mk("删除", () => removeAccount(a), "danger"));
@@ -228,6 +229,67 @@
       await refresh();
     } catch (e) { toast(e.message, true); }
     finally { btn.disabled = false; }
+  });
+
+  // ---------- 验证码登录 ----------
+  let cap = { id: null, busy: false, seq: 0 };
+
+  function capError(e) {
+    if (e.status === 401) { toPortalLogin(); return; }
+    $("cap-err").textContent = e.message + (e.trace ? "\n" + e.trace.join("\n") : "");
+    show("cap-err", true);
+  }
+
+  async function loadCaptcha() {
+    const my = ++cap.seq;   // 换一张/关闭时以最后一次为准，丢弃过期响应
+    show("cap-img", false); show("cap-loading", true);
+    $("cap-loading").textContent = "获取验证码中…";
+    $("cap-ok").disabled = true; $("cap-refresh").disabled = true;
+    $("cap-code").value = "";
+    try {
+      const res = await api(`/api/accounts/${cap.id}/captcha`, { method: "POST" });
+      if (my !== cap.seq) return;
+      if (res.required) {
+        $("cap-img").src = res.image;
+        show("cap-img", true); show("cap-loading", false);
+      } else {
+        $("cap-loading").textContent = "学校当前不要求验证码，直接点“登录”。";
+      }
+      $("cap-ok").disabled = false;
+      $("cap-code").focus();
+    } catch (e) {
+      if (my !== cap.seq) return;
+      $("cap-loading").textContent = "获取失败，可点“换一张”重试。";
+      capError(e);
+    } finally {
+      if (my === cap.seq) $("cap-refresh").disabled = false;
+    }
+  }
+
+  function openCaptcha(a) {
+    cap = { id: a.id, busy: false, seq: cap.seq + 1 };
+    $("cap-title").textContent = `${a.label} · 验证码登录`;
+    show("cap-err", false);
+    $("dlg-cap").showModal();
+    loadCaptcha();
+  }
+  $("cap-refresh").addEventListener("click", () => { show("cap-err", false); loadCaptcha(); });
+  $("cap-cancel").addEventListener("click", () => $("dlg-cap").close());
+  $("dlg-cap").addEventListener("close", () => { cap.seq++; });
+  $("f-cap").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (cap.busy) return;
+    if (!$("cap-img").hidden && !$("cap-code").value.trim()) { $("cap-code").focus(); return; }
+    cap.busy = true; $("cap-ok").disabled = true; show("cap-err", false);
+    try {
+      await api(`/api/accounts/${cap.id}/captcha-login`, { method: "POST", body: { captcha: $("cap-code").value } });
+      $("dlg-cap").close();
+      toast("登录成功，正在检查课表…");
+      await refresh();
+    } catch (e) {
+      capError(e);
+      if (e.status !== 401) await loadCaptcha();   // 表单 token 只能用一次：失败后自动换一张新的
+    } finally { cap.busy = false; }
   });
 
   // ---------- 课表 / 手动签到 ----------

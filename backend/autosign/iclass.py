@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import random
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -24,6 +25,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 SSO_LOGIN = "https://sso.buaa.edu.cn/login"
+SSO_CAPTCHA = "https://sso.buaa.edu.cn/captcha"
+_CAPTCHA_TYPES = {"image/png", "image/jpeg", "image/gif"}
+CAPTCHA_MSG = "统一认证要求图片验证码，请点“验证码登录”手动输入一次"
 PORTAL_CALLBACK = "https://d.buaa.edu.cn/login?cas_login=true"
 ICLASS_ENTRY = "https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter"
 API = "https://iclass.buaa.edu.cn:8347"
@@ -138,6 +142,7 @@ class Client:
         self.session_id: str | None = None
         self.login_name: str | None = None
         self.trace: list[str] = []
+        self._page: tuple[str, str, dict] | None = None   # begin_captcha_login 留下的登录页
 
     # ---------- 状态 ----------
     @property
@@ -194,7 +199,8 @@ class Client:
         raise ClientError("protocol", "重定向次数过多")
 
     # ---------- 阶段一：WebVPN + 统一认证 ----------
-    def _gateway_login(self, number: str, password: str):
+    def _open_login(self) -> tuple[str, str, dict]:
+        """取统一认证登录页并校验表单目标。返回 (页面 HTML, 表单提交地址, 表单)。"""
         start = webvpn.gateway_url(f"{SSO_LOGIN}?service={quote(PORTAL_CALLBACK, safe='')}")
         r, page_url, _ = self._walk(start)
         form = webvpn.find_login_form(r.text)
@@ -207,8 +213,26 @@ class Client:
             raise ClientError("protocol", f"登录表单目标异常：{e}") from None
         if not logical or urlsplit(logical).hostname != "sso.buaa.edu.cn":
             raise ClientError("protocol", "登录表单目标不是学校统一认证，已拒绝发送凭据")
+        return r.text, action, form
+
+    def _fetch_captcha(self, cid: str) -> tuple[bytes, str]:
+        """取验证码图片（必须与随后提交登录用同一个会话/Cookie）。"""
+        url = webvpn.gateway_url(f"{SSO_CAPTCHA}?captchaId={cid}&r={random.randrange(10 ** 5):05d}")
+        r = self._send("GET", url)
+        ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if r.status_code != 200 or ctype not in _CAPTCHA_TYPES or not r.content or len(r.content) > 200_000:
+            raise ClientError("protocol", "验证码图片获取失败")
+        return r.content, ctype
+
+    def _gateway_login(self, number: str, password: str, captcha: str | None = None, page=None):
+        html, action, form = page or self._open_login()
+        if captcha is None and webvpn.captcha_required(html):
+            # 没有验证码就提交只会被拒（学校回“Invalid credentials”），白白增加失败记录：不发送凭据
+            raise ClientError("captcha", CAPTCHA_MSG)
         data = dict(form["fields"])
         data.update(username=number, password=password)
+        if captcha:
+            data["captcha"] = captcha
         r = self._send("POST", action, data=data)
         if r.status_code in (307, 308):
             raise ClientError("protocol", "统一认证返回 307/308，已停止以避免重放密码")
@@ -227,10 +251,18 @@ class Client:
             return
         # 未发生跳转：账号或密码错误，或需要验证码
         if r.status_code in (200, 401):
+            err = webvpn.sso_error_text(r.text)
+            if re.search(r"captcha|验证码|validation code", err, re.I):
+                raise ClientError("captcha", "验证码错误或已过期，请重新获取验证码" if captcha else CAPTCHA_MSG)
             if webvpn.needs_extra_auth_prompt(r.text):
                 raise ClientError(
                     "captcha", "统一认证要求验证码/额外认证，请先在浏览器登录一次后重试")
-            err = webvpn.sso_error_text(r.text)
+            if captcha is None and webvpn.captcha_required(r.text):
+                raise ClientError("captcha", CAPTCHA_MSG)
+            if captcha:
+                # 提交了验证码仍被拒：学校对“验证码错/密码错”给同一句话，这里不能断定是密码错
+                raise ClientError("auth", "学号、密码或验证码有误（学校的提示不区分）"
+                                  + (f"：{err}" if err else ""))
             raise ClientError("auth", "学号或密码错误" + (f"（{err}）" if err else ""))
         raise ClientError("protocol", f"统一认证响应异常（HTTP {r.status_code}）")
 
@@ -270,15 +302,19 @@ class Client:
             raise ClientError("protocol", "iClass 登录响应缺少 id/sessionId")
         self.user_id, self.session_id = str(res["id"]), str(res["sessionId"])
 
-    def login(self, number: str, password: str):
+    def login(self, number: str, password: str, captcha: str | None = None, page=None):
         if not re.fullmatch(r"[A-Za-z0-9]{4,20}", number or ""):
             raise ClientError("input", "学号格式不正确")
         if not password:
             raise ClientError("input", "密码不能为空")
-        self.clear()  # 失败时不得沿用上一个账号的身份
-        self.trace = []
+        if page is None:
+            self.clear()  # 失败时不得沿用上一个账号的身份
+            self.trace = []
+        else:
+            # 带验证码的第二步：要保留第一步建立的 Cookie（验证码与会话绑定），只丢掉旧身份
+            self.user_id = self.session_id = self.login_name = None
         try:
-            self._gateway_login(number, password)
+            self._gateway_login(number, password, captcha, page)
             self._business_login(number)
         except ClientError as e:
             e.trace = list(self.trace)
@@ -287,6 +323,43 @@ class Client:
         except BaseException:
             self.clear()
             raise
+
+    # ---------- 人工输入验证码的两步登录 ----------
+    def begin_captcha_login(self) -> tuple[bytes, str] | None:
+        """第一步：取登录页并拉验证码图片。不发送任何凭据。
+
+        返回 (图片, 类型)；学校当前不要求验证码则返回 None（直接调 finish_captcha_login 即可）。
+        """
+        self.clear()
+        self.trace = []
+        self._page = None
+        try:
+            page = self._open_login()
+            image = None
+            if webvpn.captcha_required(page[0]):
+                cid = webvpn.captcha_id(page[0])
+                if not cid:
+                    raise ClientError("protocol", "登录页要求验证码，但未找到验证码编号")
+                image = self._fetch_captcha(cid)
+        except ClientError as e:
+            e.trace = list(self.trace)
+            self.clear()
+            raise
+        self._page = page
+        return image
+
+    def finish_captcha_login(self, number: str, password: str, captcha: str):
+        """第二步：用同一会话提交学号、密码和验证码。表单 token 只能用一次，失败后需重新 begin。"""
+        page, self._page = self._page, None
+        if page is None:
+            raise ClientError("input", "验证码已失效，请重新获取")
+        captcha = (captcha or "").strip()
+        if webvpn.captcha_required(page[0]):
+            if not re.fullmatch(r"[A-Za-z0-9]{1,12}", captcha):
+                raise ClientError("input", "请输入图片中的验证码（字母或数字）")
+        else:
+            captcha = ""
+        self.login(number, password, captcha or None, page)
 
     # ---------- 业务接口 ----------
     def _api(self, method: str, logical: str, *, params=None, data=None,

@@ -36,6 +36,10 @@ class AccountPatch(BaseModel):
     enabled: bool | None = None
 
 
+class CaptchaLogin(BaseModel):
+    captcha: str = Field(default="", max_length=16)
+
+
 class SignReq(BaseModel):
     date: Date
     id: str = Field(max_length=64)
@@ -142,6 +146,23 @@ def check_account(aid: int):
         raise HTTPException(400, "账号未开启")
     manager.kick(aid, force=True)
     return {"ok": True}
+
+
+# ---------------- 人工输入验证码登录 ----------------
+@router.post("/accounts/{aid}/captcha")
+def captcha_begin(aid: int):
+    """取登录验证码图片（不发送任何凭据）。每次调用都是一个新的登录会话。"""
+    _get(aid)
+    return manager.captcha_begin(aid)
+
+
+@router.post("/accounts/{aid}/captcha-login")
+def captcha_login(aid: int, body: CaptchaLogin):
+    """用已保存的密码 + 用户输入的验证码完成一次登录；成功后会话交给调度器使用。"""
+    _get(aid)
+    audit(f"account captcha-login id={aid}")
+    manager.captcha_finish(aid, body.captcha)
+    return _account_dict(_get(aid))
 
 
 # ---------------- 课表 / 手动签到 ----------------

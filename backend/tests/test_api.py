@@ -67,6 +67,37 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([x["same_slot"] for x in wed["lessons"]], [2, 2])
         self.assertEqual(j["summary"], {"total": 2, "signed": 1, "unsigned": 1, "unknown": 0})
 
+    def test_captcha_login_endpoints(self):
+        from autosign.iclass import ClientError
+        from autosign.scheduler import manager
+
+        aid = self.c.post("/api/accounts", json={"number": "20370001", "password": "pw"}).json()["id"]
+        self.assertEqual(self.c.post("/api/accounts/999/captcha").status_code, 404)
+        self.assertEqual(self.c.post("/api/accounts/999/captcha-login", json={"captcha": "a"}).status_code, 404)
+
+        calls = []
+        orig = manager.captcha_begin, manager.captcha_finish
+        manager.captcha_begin = lambda a: {"required": True, "image": "data:image/png;base64,AAAA"}
+
+        def finish(a, code):
+            calls.append((a, code))
+            if code == "bad":
+                raise ClientError("auth", "学号、密码或验证码有误")
+        manager.captcha_finish = finish
+        try:
+            r = self.c.post(f"/api/accounts/{aid}/captcha")
+            self.assertEqual((r.status_code, r.json()["required"]), (200, True))
+            ok = self.c.post(f"/api/accounts/{aid}/captcha-login", json={"captcha": "ab12"})
+            self.assertEqual(ok.status_code, 200, ok.text)
+            self.assertNotIn("password", ok.text)
+            bad = self.c.post(f"/api/accounts/{aid}/captcha-login", json={"captcha": "bad"})
+            self.assertEqual((bad.status_code, bad.json()["error"]["kind"]), (422, "auth"))
+            self.assertEqual(self.c.post(f"/api/accounts/{aid}/captcha-login", json={"captcha": "x" * 17}).status_code, 422)
+        finally:
+            manager.captcha_begin, manager.captcha_finish = orig
+            self.c.delete(f"/api/accounts/{aid}")   # 各用例共用同一个库，不留残留
+        self.assertEqual(calls, [(aid, "ab12"), (aid, "bad")])
+
     def test_frontend_uses_relative_api_paths(self):
         # 应用挂在 /<id>/ 下，前端若用绝对 /api/... 会打到入口而不是本应用
         from pathlib import Path

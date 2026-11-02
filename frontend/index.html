@@ -56,6 +56,27 @@
   </form>
 </dialog>
 
+<!-- 验证码登录：学校统一认证要求图片验证码时，由人输入一次 -->
+<dialog id="dlg-cap">
+  <form id="f-cap" method="dialog" autocomplete="off">
+    <h3 id="cap-title">验证码登录</h3>
+    <p class="muted">学校统一认证要求输入图片验证码。输入后会用已保存的密码登录一次，之后的签到沿用这次登录。</p>
+    <div class="cap-box">
+      <img id="cap-img" alt="验证码图片" hidden>
+      <span id="cap-loading" class="hint">获取验证码中…</span>
+      <button id="cap-refresh" class="btn ghost small" type="button">换一张</button>
+    </div>
+    <label>验证码
+      <input id="cap-code" maxlength="12" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+    </label>
+    <p id="cap-err" class="err" hidden></p>
+    <div class="row">
+      <button class="btn ghost" type="button" id="cap-cancel">取消</button>
+      <button class="btn primary" type="submit" id="cap-ok" disabled>登录</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- 课表 / 手动签到 -->
 <dialog id="dlg-sched" class="wide">
   <div class="sched-head">

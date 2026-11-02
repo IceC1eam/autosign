@@ -15,6 +15,9 @@ class FakeClient:
     lessons: dict = {}      # 课程 id -> Lesson（共享，便于测试修改）
     signs: list = []
     login_error: ClientError | None = None
+    captcha_image: tuple | None = (b"\x89PNGfake", "image/png")   # None = 学校当前不要求验证码
+    finish_error: ClientError | None = None
+    finished: list = []
 
     def __init__(self):
         self._in = False
@@ -29,6 +32,15 @@ class FakeClient:
     def login(self, number, password):
         if FakeClient.login_error:
             raise FakeClient.login_error
+        self._in = True
+
+    def begin_captcha_login(self):
+        return FakeClient.captcha_image
+
+    def finish_captcha_login(self, number, password, code):
+        FakeClient.finished.append((number, password, code))
+        if FakeClient.finish_error:
+            raise FakeClient.finish_error
         self._in = True
 
     def schedules(self, day):
@@ -52,6 +64,7 @@ class SchedulerTests(unittest.TestCase):
         for f in os.listdir(TMP):
             os.remove(os.path.join(TMP, f))
         FakeClient.lessons, FakeClient.signs, FakeClient.login_error = {}, [], None
+        FakeClient.captcha_image, FakeClient.finish_error, FakeClient.finished = (b"\x89PNGfake", "image/png"), None, []
         self._orig = scheduler.Client
         scheduler.Client = FakeClient
         self.m = scheduler.Manager()
@@ -148,6 +161,75 @@ class SchedulerTests(unittest.TestCase):
         self.run_job(force=True)
         self.assertIsNone(self.plan("1"))
         self.assertEqual(FakeClient.signs, [])
+
+    # ---------- 人工输入验证码登录 ----------
+    def state(self):
+        return db.one("SELECT state,state_msg FROM accounts WHERE id=?", (self.aid,))
+
+    def test_captcha_login_hands_session_to_runner(self):
+        db.x("UPDATE accounts SET state='captcha' WHERE id=?", (self.aid,))
+        FakeClient.lessons = {"1": lesson("1", 60)}
+        begin = self.m.captcha_begin(self.aid)
+        self.assertTrue(begin["required"])
+        self.assertTrue(begin["image"].startswith("data:image/png;base64,"))
+        self.m.pool.submit = lambda *a, **k: None   # 不真正起后台任务，只检查会话交接
+        self.m.captcha_finish(self.aid, "ab12")
+        self.assertEqual(FakeClient.finished, [("20370001", "pw", "ab12")])   # 用已存密码解密后提交
+        self.assertTrue(self.m.runner(self.aid).client.logged_in)
+        self.assertEqual(self.state()["state"], "ok")
+        self.assertTrue(db.one("SELECT 1 FROM events WHERE kind='login'"))
+
+    def test_captcha_token_is_single_use(self):
+        self.m.captcha_begin(self.aid)
+        self.m.pool.submit = lambda *a, **k: None
+        self.m.captcha_finish(self.aid, "ab12")
+        with self.assertRaises(ClientError) as cm:   # 表单 token 只能用一次
+            self.m.captcha_finish(self.aid, "ab12")
+        self.assertEqual(cm.exception.kind, "input")
+        self.assertEqual(len(FakeClient.finished), 1)
+
+    def test_captcha_rejected_keeps_paused_and_consumes_token(self):
+        FakeClient.finish_error = ClientError("auth", "学号、密码或验证码有误")
+        self.m.captcha_begin(self.aid)
+        with self.assertRaises(ClientError):
+            self.m.captcha_finish(self.aid, "zzzz")
+        # 提交了验证码仍被拒，不能断定是密码错：保持“需要验证码”，不标 auth_failed
+        self.assertEqual(self.state()["state"], "captcha")
+        self.assertFalse(self.m.runner(self.aid).client.logged_in)
+        with self.assertRaises(ClientError) as cm:
+            self.m.captcha_finish(self.aid, "zzzz")
+        self.assertEqual(cm.exception.kind, "input")
+        self.assertEqual(len(FakeClient.finished), 1)
+
+    def test_captcha_finish_expired(self):
+        self.m.captcha_begin(self.aid)
+        c, ts = self.m._pending[self.aid]
+        self.m._pending[self.aid] = (c, ts - scheduler.CAPTCHA_TTL - 1)
+        with self.assertRaises(ClientError):
+            self.m.captcha_finish(self.aid, "ab12")
+        self.assertEqual(FakeClient.finished, [])
+
+    def test_captcha_begin_rate_limited(self):
+        self.m.captcha_begin(self.aid)
+        with self.assertRaises(ClientError):
+            self.m.captcha_begin(self.aid)
+
+    def test_captcha_not_required_returns_flag(self):
+        FakeClient.captcha_image = None
+        self.assertEqual(self.m.captcha_begin(self.aid), {"required": False})
+
+    def test_forget_drops_pending_login(self):
+        self.m.captcha_begin(self.aid)
+        self.m.forget(self.aid)
+        self.assertNotIn(self.aid, self.m._pending)
+
+    def test_scheduler_pauses_on_captcha_without_retry(self):
+        FakeClient.login_error = ClientError("captcha", iclass.CAPTCHA_MSG)
+        FakeClient.lessons = {"1": lesson("1", 3)}
+        self.run_job(force=True)
+        self.assertEqual(self.state()["state"], "captcha")
+        self.m.pool.submit = lambda *a, **k: self.fail("captcha-paused account must not be retried")
+        self.m.tick()
 
 
 if __name__ == "__main__":

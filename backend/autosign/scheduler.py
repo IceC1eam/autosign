@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import base64
 import logging
 import random
 import threading
@@ -25,6 +26,8 @@ WINDOW_LEAD = 600          # 课前 10 分钟
 TICK = 5                   # 调度循环间隔（秒）
 MAX_ATTEMPTS = 5
 PAUSED_STATES = ("auth_failed", "captcha")
+CAPTCHA_TTL = 180          # 取到验证码后多久内必须提交（秒）
+CAPTCHA_GAP = 3            # 同一账号两次取验证码的最小间隔（秒）
 
 
 def hms(ts: float) -> str:
@@ -49,6 +52,7 @@ class Manager:
         self.stop_ev = threading.Event()
         self.thread: threading.Thread | None = None
         self._guard = threading.Lock()
+        self._pending: dict[int, tuple[Client, float]] = {}   # 账号 id -> (等待验证码的登录, 取图时刻)
 
     # ---------- 生命周期 ----------
     def start(self):
@@ -68,6 +72,7 @@ class Manager:
     def forget(self, aid: int):
         with self._guard:
             r = self.runners.pop(aid, None)
+            self._pending.pop(aid, None)
         if r:
             with r.lock:
                 r.client.clear()
@@ -284,6 +289,55 @@ class Manager:
             db.x("UPDATE plans SET status='unknown',message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
                  (res.message, now, *key))
             db.event(aid, "sign", f"《{plan['name']}》结果未知：{res.message}")
+
+    # ---------- 人工输入验证码登录 ----------
+    def captcha_begin(self, aid: int) -> dict:
+        """取验证码图片。待完成的登录用独立 Client 保存，不占用账号的运行锁。"""
+        if not db.one("SELECT 1 FROM accounts WHERE id=?", (aid,)):
+            raise ClientError("input", "账号不存在")
+        now = time.time()
+        with self._guard:
+            last = self._pending.get(aid)
+            if last and now - last[1] < CAPTCHA_GAP:
+                raise ClientError("input", "操作太频繁，请稍后再换验证码")
+        c = Client()
+        got = c.begin_captcha_login()
+        with self._guard:
+            self._pending[aid] = (c, now)
+        if got is None:
+            return {"required": False}
+        img, mime = got
+        return {"required": True, "image": f"data:{mime};base64,{base64.b64encode(img).decode()}"}
+
+    def captcha_finish(self, aid: int, code: str):
+        acc = db.one("SELECT * FROM accounts WHERE id=?", (aid,))
+        if not acc:
+            raise ClientError("input", "账号不存在")
+        with self._guard:
+            item = self._pending.pop(aid, None)   # 表单 token 只能用一次：无论成败都作废
+        if not item or time.time() - item[1] > CAPTCHA_TTL:
+            raise ClientError("input", "验证码已过期，请重新获取")
+        c = item[0]
+        try:
+            c.finish_captcha_login(acc["number"], crypto.decrypt(acc["cred"]), code)
+        except ClientError as e:
+            if e.kind in ("auth", "captcha"):
+                # 提交了验证码仍被拒，无法断定是密码错：保持“需要验证码”暂停态，由用户决定再试或改密码
+                db.x("UPDATE accounts SET state='captcha',state_msg=?,state_at=? WHERE id=?",
+                     (e.message, time.time(), aid))
+            db.event(aid, "error", f"验证码登录未通过（{e.kind}）：{e.message}")
+            if e.kind not in ("auth", "captcha", "input") and e.trace:
+                db.event(aid, "trace", " | ".join(e.trace[-6:]))
+            raise
+        r = self.runner(aid)
+        with r.lock:
+            r.client.clear()
+            r.client = c
+            r.next_poll = 0.0
+        db.x("UPDATE accounts SET state='ok',state_msg='',state_at=? WHERE id=?", (time.time(), aid))
+        db.event(aid, "login", "已通过验证码登录 iClass")
+        if acc["enabled"]:
+            self.kick(aid, force=True)
 
     # ---------- 手动 ----------
     def manual_sign(self, aid: int, day: date, lesson_id: str):

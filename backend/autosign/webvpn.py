@@ -231,6 +231,24 @@ def sso_error_text(html: str) -> str:
     return re.sub(r"\s+", " ", m.group(1)).strip()[:120] if m else ""
 
 
+# 学校统一认证要求验证码时，服务端会在页面里渲染一段脚本：
+#   $("#captchaParent").show(); config.captcha = {type:'image', id:'<数字>'}
+# 并由 JS 动态加入 <input name="captcha">，静态 HTML 里看不到，所以要读脚本。
+_CAPTCHA_SHOW_RE = re.compile(r"""\$\(\s*["']#captchaParent["']\s*\)\s*\.show\s*\(""")
+_CAPTCHA_ID_RE = re.compile(r"""captcha\s*=\s*\{[^}]*?\bid\s*:\s*["']([A-Za-z0-9_-]{1,40})["']""", re.S)
+
+
+def captcha_required(html: str) -> bool:
+    """登录页是否（通过脚本）要求填写验证码。"""
+    return bool(_CAPTCHA_SHOW_RE.search(html))
+
+
+def captcha_id(html: str) -> str | None:
+    """验证码 id（只允许安全字符，会被拼进图片 URL）；页面没有给出则为 None。"""
+    m = _CAPTCHA_ID_RE.search(html)
+    return m.group(1) if m else None
+
+
 def needs_extra_auth_prompt(html: str) -> bool:
     """验证码 / 额外认证：交给用户处理，客户端不提供交互。
 

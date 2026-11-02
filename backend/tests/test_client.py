@@ -11,6 +11,14 @@ FORM = ('<form id="loginForm" action="login" method="post"><input name="username
         '<input name="password"><input name="execution" value="e1">'
         '<input name="_eventId" value="submit"></form>')
 SSO_PAGE = webvpn.gateway_url("https://sso.buaa.edu.cn/login")
+# 学校页面的真实形态：验证码容器默认 display:none，由服务端渲染的脚本显示并动态加入输入框
+CAPTCHA_SCRIPT = ('<div class="form-group" style="display: none;" id="captchaParent"></div>'
+                  '<script>vpn_eval((function(){ $("#captchaParent").show(); $("#captchaLabel").show(); '
+                  "config.captcha = {\n    type: 'image',\n    id: '2132814849'\n}; "
+                  "function captchaUrl() { return 'captcha?captchaId=' + config.captcha.id; } "
+                  '} ).toString().slice(12, -2),"");</script>')
+CAPTCHA_FORM = FORM + CAPTCHA_SCRIPT
+ERR = '<div id="errorDiv" class="alert"><p>{}</p></div>'
 
 
 def resp(status=200, body="", headers=None, url=""):
@@ -64,15 +72,22 @@ class ParseTests(unittest.TestCase):
         self.assertFalse(L.window_open(L.end + timedelta(seconds=1)))
 
 
-class LoginTests(unittest.TestCase):
+class LoginBase(unittest.TestCase):
     def _router(self, post_status=302, post_body="", sso_form=FORM):
         holder = self.holder = {}
 
         def route(method, url, kw):
             logical = webvpn.logical_url(url) if url != "https://d.buaa.edu.cn/login" else None
+            if method == "GET" and logical and logical.startswith("https://sso.buaa.edu.cn/captcha?captchaId="):
+                holder.setdefault("captcha_gets", []).append(logical)
+                holder["http"].cookies.set("JSESSIONID", "j1", domain="d.buaa.edu.cn")   # 验证码与会话绑定
+                return resp(200, b"\x89PNGfake", {"Content-Type": "image/png;charset=UTF-8"})
             if method == "GET" and logical and logical.startswith("https://sso.buaa.edu.cn/login?service="):
+                holder["login_gets"] = holder.get("login_gets", 0) + 1
                 return resp(200, sso_form)
             if method == "POST":
+                if "http" in holder:
+                    holder["post_cookie"] = holder["http"].cookies.get("JSESSIONID")
                 if post_status == 302:
                     holder["http"].cookies.set("wengine_vpn_ticket", "x", domain="d.buaa.edu.cn")
                     return resp(302, headers={"Location": "https://d.buaa.edu.cn/login?cas_login=true&ticket=T"})
@@ -89,6 +104,8 @@ class LoginTests(unittest.TestCase):
             return resp(404)
         return route
 
+
+class LoginTests(LoginBase):
     def test_success(self):
         http = FakeHTTP(self._router())
         self.holder["http"] = http
@@ -133,6 +150,116 @@ class LoginTests(unittest.TestCase):
         with self.assertRaises(ClientError):
             c.login("20371234", "bad")
         self.assertIsNone(c.user_id)
+
+
+class CaptchaLoginTests(LoginBase):
+    """学校要求图片验证码：无人值守的 login() 不发送凭据；人工输入验证码的两步登录。"""
+
+    def make(self, **kw):
+        http = FakeHTTP(self._router(sso_form=kw.pop("sso_form", CAPTCHA_FORM), **kw))
+        self.holder["http"] = http
+        return Client(http), http
+
+    def posts(self, http):
+        return [x for x in http.calls if x[0] == "POST"]
+
+    def test_detects_real_page_shape(self):
+        self.assertTrue(webvpn.captcha_required(CAPTCHA_FORM))
+        self.assertEqual(webvpn.captcha_id(CAPTCHA_FORM), "2132814849")
+        self.assertFalse(webvpn.captcha_required(FORM))
+        # 容器默认 display:none，静态判断看不出来（旧逻辑据此漏判）
+        self.assertFalse(webvpn.needs_extra_auth_prompt(CAPTCHA_FORM))
+
+    def test_captcha_id_charset_is_restricted(self):
+        evil = CAPTCHA_FORM.replace("2132814849", "1&x=http://evil/")
+        self.assertIsNone(webvpn.captcha_id(evil))
+
+    def test_unattended_login_does_not_send_credentials(self):
+        c, http = self.make()
+        with self.assertRaises(ClientError) as cm:
+            c.login("20371234", "pw")
+        self.assertEqual(cm.exception.kind, "captcha")
+        self.assertEqual(self.posts(http), [])    # 不带验证码只会被拒并留下失败记录
+
+    def test_two_step_success_reuses_same_session(self):
+        c, http = self.make()
+        img, mime = c.begin_captcha_login()
+        self.assertEqual((img, mime), (b"\x89PNGfake", "image/png"))
+        self.assertEqual(self.posts(http), [])    # 第一步不发送任何凭据
+        c.finish_captcha_login("20371234", "pw", "ab12")
+        self.assertTrue(c.logged_in)
+        post = self.posts(http)[0]
+        self.assertEqual(post[2]["data"]["captcha"], "ab12")
+        self.assertEqual(post[2]["data"]["execution"], "e1")          # 沿用第一步取到的表单，不重新取页面
+        self.assertEqual(self.holder["login_gets"], 1)
+        self.assertEqual(self.holder["post_cookie"], "j1")           # 第一步的 Cookie 没被清掉
+        self.assertEqual(len(self.posts(http)), 1)
+        self.assertEqual(self.holder["captcha_gets"][0].split("?")[0], "https://sso.buaa.edu.cn/captcha")
+        self.assertIn("captchaId=2132814849", self.holder["captcha_gets"][0])
+        self.assertFalse(any("ab12" in t or "pw" == t for t in c.trace))
+
+    def test_wrong_captcha_is_captcha_error(self):
+        c, _ = self.make(post_status=401, post_body=FORM + CAPTCHA_SCRIPT + ERR.format("Invalid captcha."))
+        c.begin_captcha_login()
+        with self.assertRaises(ClientError) as cm:
+            c.finish_captcha_login("20371234", "pw", "zzzz")
+        self.assertEqual(cm.exception.kind, "captcha")
+        self.assertFalse(c.logged_in)
+
+    def test_invalid_credentials_with_captcha_is_not_blamed_on_password_alone(self):
+        c, _ = self.make(post_status=401, post_body=FORM + CAPTCHA_SCRIPT + ERR.format("Invalid credentials."))
+        c.begin_captcha_login()
+        with self.assertRaises(ClientError) as cm:
+            c.finish_captcha_login("20371234", "pw", "zzzz")
+        self.assertEqual(cm.exception.kind, "auth")
+        self.assertIn("验证码", cm.exception.message)
+
+    def test_token_is_single_use(self):
+        c, http = self.make(post_status=401, post_body=FORM + CAPTCHA_SCRIPT + ERR.format("Invalid credentials."))
+        c.begin_captcha_login()
+        with self.assertRaises(ClientError):
+            c.finish_captcha_login("20371234", "pw", "zzzz")
+        with self.assertRaises(ClientError) as cm:
+            c.finish_captcha_login("20371234", "pw", "zzzz")
+        self.assertEqual(cm.exception.kind, "input")
+        self.assertEqual(len(self.posts(http)), 1)    # 失败后不会拿旧表单再发一次
+
+    def test_finish_without_begin(self):
+        c, http = self.make()
+        with self.assertRaises(ClientError) as cm:
+            c.finish_captcha_login("20371234", "pw", "ab12")
+        self.assertEqual(cm.exception.kind, "input")
+        self.assertEqual(self.posts(http), [])
+
+    def test_malformed_captcha_text_not_sent(self):
+        c, http = self.make()
+        c.begin_captcha_login()
+        for bad in ("", "a b", "x" * 13, "ab&c=1"):
+            c.begin_captcha_login()
+            with self.assertRaises(ClientError) as cm:
+                c.finish_captcha_login("20371234", "pw", bad)
+            self.assertEqual(cm.exception.kind, "input")
+        self.assertEqual(self.posts(http), [])
+
+    def test_no_captcha_page_needs_no_code(self):
+        c, http = self.make(sso_form=FORM)
+        self.assertIsNone(c.begin_captcha_login())
+        c.finish_captcha_login("20371234", "pw", "")
+        self.assertTrue(c.logged_in)
+        self.assertNotIn("captcha", self.posts(http)[0][2]["data"])
+
+    def test_non_image_captcha_response_rejected(self):
+        c, http = self.make()
+        orig = http.router
+
+        def route(m, u, k):
+            if "captcha?captchaId" in (webvpn.logical_url(u) or ""):
+                return resp(200, "<html>login</html>", {"Content-Type": "text/html"})
+            return orig(m, u, k)
+        http.router = route
+        with self.assertRaises(ClientError) as cm:
+            c.begin_captcha_login()
+        self.assertEqual(cm.exception.kind, "protocol")
 
 
 class ApiTests(unittest.TestCase):
