@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS events(
   kind TEXT NOT NULL,
   message TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS notices(          -- 已发出的通知：去重/冷却，重启后仍有效
+  key TEXT PRIMARY KEY,
+  ts REAL NOT NULL
+);
 """
 
 
@@ -84,6 +88,18 @@ def x(sql: str, args=()) -> int:
     with _lock:
         cur = conn().execute(sql, args)
         return cur.lastrowid or 0
+
+
+def claim_notice(key: str, cooldown: float) -> bool:
+    """原子地“认领”一条通知：冷却期内已发过返回 False，否则记下时间并返回 True。"""
+    now = time.time()
+    with _lock:
+        row = one("SELECT ts FROM notices WHERE key=?", (key,))
+        if row and now - row["ts"] < cooldown:
+            return False
+        x("INSERT OR REPLACE INTO notices(key,ts) VALUES(?,?)", (key, now))
+        x("DELETE FROM notices WHERE ts < ?", (now - 30 * 86400,))
+        return True
 
 
 def event(account_id: int | None, kind: str, message: str):

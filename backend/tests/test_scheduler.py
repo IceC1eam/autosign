@@ -7,7 +7,7 @@ from datetime import timedelta
 TMP = tempfile.mkdtemp()
 os.environ["APP_DATA"] = TMP
 
-from autosign import crypto, db, iclass, scheduler  # noqa: E402
+from autosign import crypto, db, iclass, notify, scheduler  # noqa: E402
 from autosign.iclass import ClientError, Lesson, SignResult  # noqa: E402
 
 
@@ -69,6 +69,12 @@ class SchedulerTests(unittest.TestCase):
         FakeClient.lessons, FakeClient.signs, FakeClient.login_error = {}, [], None
         FakeClient.captcha_image, FakeClient.finish_error, FakeClient.finished = (b"\x89PNGfake", "image/png"), None, []
         FakeClient.sign_result = None
+        # 通知：配上假密钥，同步“发送”并只记录，不联网
+        os.environ[notify.ENV_KEY] = "SCT" + "a1B2c3D4e5" * 3
+        self.sent: list[tuple[str, str]] = []
+        self._nd, self._nv = notify._dispatch, notify._deliver
+        notify._dispatch = lambda fn, *a: fn(*a)
+        notify._deliver = lambda key, title, body, aid: self.sent.append((title, body))
         self._orig = scheduler.Client
         scheduler.Client = FakeClient
         self.m = scheduler.Manager()
@@ -77,6 +83,8 @@ class SchedulerTests(unittest.TestCase):
 
     def tearDown(self):
         scheduler.Client = self._orig
+        notify._dispatch, notify._deliver = self._nd, self._nv
+        os.environ.pop(notify.ENV_KEY, None)
         self.m.shutdown()
 
     def run_job(self, force=False):
@@ -212,6 +220,146 @@ class SchedulerTests(unittest.TestCase):
         self.run_job(force=True)
         self.assertIsNone(self.plan("1"))
         self.assertEqual(FakeClient.signs, [])
+
+    # ---------- 通知 ----------
+    def add_plan(self, lid, start_in_min, name=None, dur=95):
+        now = time.time()
+        st = now + start_in_min * 60
+        db.x("INSERT INTO plans VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+             (self.aid, iclass.now_china().date().isoformat(), lid, name or "课" + lid,
+              st, st + dur * 60, st - 300, "pending", 0, "", now))
+
+    def pause(self, ago=3600, state="captcha"):
+        db.x("UPDATE accounts SET state=?,state_at=? WHERE id=?", (state, time.time() - ago, self.aid))
+
+    def test_captcha_pause_notifies_once_with_next_lesson(self):
+        self.add_plan("1", 120, name="算法设计")
+        FakeClient.login_error = ClientError("captcha", "统一认证要求图片验证码")
+        self.run_job(force=True)
+        self.assertEqual(self.state()["state"], "captcha")
+        self.assertEqual(len(self.sent), 1)
+        title, body = self.sent[0]
+        self.assertIn("验证码", title)
+        self.assertIn("账号：t", body)
+        self.assertIn("《算法设计》", body)
+        self.assertIn("验证码登录", body)
+        self.run_job(force=True)            # 再次失败：冷却内不重复
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotIn("20370001", body)   # 不含学号
+        self.assertNotIn("pw", body.replace("账号", ""))
+
+    def test_bad_password_pause_notifies(self):
+        FakeClient.login_error = ClientError("auth", "学号或密码错误")
+        self.run_job(force=True)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("密码", self.sent[0][1])
+
+    def test_transient_error_does_not_notify(self):
+        FakeClient.login_error = ClientError("network", "网络请求失败（ReadTimeout）")
+        self.run_job(force=True)
+        self.assertEqual(self.state()["state"], "error")
+        self.assertEqual(self.sent, [])
+
+    def test_final_failure_notifies_once_with_reason(self):
+        FakeClient.sign_result = SignResult("failed", "iClass 返回错误（STATUS=1，ERRCODE=7）：签到未开始")
+        FakeClient.lessons = {"1": lesson("1", 5, name="线性系统")}
+        self.run_job()
+        for _ in range(scheduler.MAX_ATTEMPTS - 1):
+            self.reject_once()
+        self.assertEqual(self.sent, [], "还有重试机会时不通知")
+        self.assertEqual(self.reject_once()["status"], "failed")
+        self.assertEqual(len(self.sent), 1)
+        title, body = self.sent[0]
+        self.assertIn("签到失败", title)
+        self.assertIn("《线性系统》", body)
+        self.assertIn("签到未开始", body)
+        self.assertIn(f"{scheduler.MAX_ATTEMPTS} 次", body)
+
+    def test_same_name_twin_lessons_share_one_failure_notice(self):
+        FakeClient.sign_result = SignResult("failed", "拒绝")
+        a = lesson("1", 5, name="高等数学", teacher="甲")
+        b = lesson("2", 5, name="高等数学", teacher="乙")
+        b.start, b.end = a.start, a.end
+        FakeClient.lessons = {"1": a, "2": b}
+        self.run_job()
+        for _ in range(scheduler.MAX_ATTEMPTS):
+            db.x("UPDATE plans SET planned_at=?", (time.time() - 1,))
+            self.run_job()
+        self.assertEqual(self.plan("1")["status"], "failed")
+        self.assertEqual(self.plan("2")["status"], "failed")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_no_time_left_for_another_try_is_final_failure(self):
+        # 下一次尝试已晚于下课：不再停在 pending，直接判失败并通知
+        FakeClient.sign_result = SignResult("failed", "拒绝")
+        FakeClient.lessons = {"1": lesson("1", -3)}
+        self.run_job()
+        db.x("UPDATE plans SET planned_at=?,end_ts=?", (time.time() - 1, time.time() + 30))
+        self.run_job()
+        self.assertEqual(self.plan("1")["status"], "failed")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_success_and_unknown_never_notify(self):
+        FakeClient.lessons = {"1": lesson("1", 5)}
+        self.run_job()
+        self.reject_once()
+        self.assertEqual(self.plan("1")["status"], "signed")
+        FakeClient.lessons = {"2": lesson("2", 5)}
+        FakeClient.sign_result = SignResult("unknown", "无法确认")
+        self.run_job(force=True)           # 窗口已开：立即提交，学校回“结果未知”
+        self.assertEqual(self.plan("2")["status"], "unknown")   # 结果未知由回查机制接管，不算最终失败
+        self.assertEqual(self.sent, [])
+
+    def test_paused_account_reminded_when_lesson_is_soon(self):
+        self.add_plan("1", 20, name="机器学习")
+        self.pause(ago=3600)
+        self.m.tick()
+        self.assertEqual(len(self.sent), 1)
+        title, body = self.sent[0]
+        self.assertIn("暂停", title)
+        self.assertIn("《机器学习》", body)
+        self.m.tick(); self.m.tick()          # 同一节课只提醒一次
+        self.assertEqual(len(self.sent), 1)
+
+    def test_paused_reminder_conditions(self):
+        self.add_plan("1", 120)               # 还早（> 30 分钟）
+        self.pause(ago=3600)
+        self.m.tick()
+        self.assertEqual(self.sent, [])
+        db.x("DELETE FROM plans")
+        self.add_plan("2", 20)
+        self.pause(ago=60)                    # 刚暂停并通知过：不立刻重复提醒
+        self.m.tick()
+        self.assertEqual(self.sent, [])
+        self.pause(ago=3600, state="ok")      # 不是暂停态：不提醒
+        self.m.pool.submit = lambda *a, **k: None
+        self.m.tick()
+        self.assertEqual(self.sent, [])
+
+    def test_paused_reminder_when_class_already_started(self):
+        self.add_plan("1", -10, name="信息系统")
+        self.pause(ago=3600)
+        self.m.tick()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("已开课", self.sent[0][1])
+
+    def test_no_notification_when_unconfigured(self):
+        os.environ.pop(notify.ENV_KEY)
+        self.add_plan("1", 20)
+        self.pause(ago=3600)
+        self.m.tick()
+        FakeClient.login_error = ClientError("captcha", "x")
+        self.run_job(force=True)
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(db.one("SELECT 1 FROM notices"))
+
+    def test_notify_exception_never_breaks_scheduling(self):
+        def boom(*a):
+            raise RuntimeError("push service down")
+        notify._deliver = boom
+        FakeClient.login_error = ClientError("captcha", "x")
+        self.run_job(force=True)              # _dispatch 同步抛出也只被 notify.send 吞掉
+        self.assertEqual(self.state()["state"], "captcha")
 
     # ---------- 人工输入验证码登录 ----------
     def state(self):

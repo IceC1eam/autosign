@@ -17,7 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
-from . import crypto, db
+from . import crypto, db, notify
 from .iclass import CHINA, Client, ClientError, SessionExpired, now_china
 
 log = logging.getLogger("autosign.scheduler")
@@ -28,10 +28,18 @@ MAX_ATTEMPTS = 12          # 单节课最多提交次数；只在学校明确拒
 PAUSED_STATES = ("auth_failed", "captcha")
 CAPTCHA_TTL = 180          # 取到验证码后多久内必须提交（秒）
 CAPTCHA_GAP = 3            # 同一账号两次取验证码的最小间隔（秒）
+PAUSE_NOTICE_GAP = 2 * 3600    # 同一账号同一暂停原因的通知冷却
+SOON_LEAD = 1800               # 暂停中的账号，下一节课在这么久内开始就再提醒一次
+SOON_AFTER_PAUSE = 600         # 暂停通知刚发过不久就不重复提醒
+FAIL_NOTICE_GAP = 12 * 3600    # 同一节课的“签到失败”通知冷却
 
 
 def hms(ts: float) -> str:
     return datetime.fromtimestamp(ts, CHINA).strftime("%H:%M:%S")
+
+
+def mdhm(ts: float) -> str:
+    return datetime.fromtimestamp(ts, CHINA).strftime("%m-%d %H:%M")
 
 
 def retry_delay(now: float, start_ts: float) -> float:
@@ -97,8 +105,9 @@ class Manager:
 
     def tick(self):
         now = time.time()
-        for acc in db.q("SELECT id,state FROM accounts WHERE enabled=1"):
+        for acc in db.q("SELECT id,label,state,state_at FROM accounts WHERE enabled=1"):
             if acc["state"] in PAUSED_STATES:
+                self._remind_paused(acc, now)
                 continue
             r = self.runner(acc["id"])
             if r.running:
@@ -147,6 +156,7 @@ class Manager:
             db.x("UPDATE accounts SET state=?,state_msg=?,state_at=? WHERE id=?",
                  (state, e.message, now, aid))
             db.event(aid, "error", f"登录失败，已暂停该账号：{e.message}")
+            self._notify_paused(aid, state, e.message, now)
         else:
             db.x("UPDATE accounts SET state='error',state_msg=?,state_at=? WHERE id=?",
                  (e.message, now, aid))
@@ -154,6 +164,61 @@ class Manager:
             r.next_poll = now + 300
             if e.trace:
                 db.event(aid, "trace", " | ".join(e.trace[-6:]))
+
+    # ---------- 通知（失败只记日志，绝不影响调度） ----------
+    @staticmethod
+    def _label(aid: int) -> str:
+        row = db.one("SELECT label FROM accounts WHERE id=?", (aid,))
+        return row["label"] if row else f"#{aid}"
+
+    def _notify_paused(self, aid: int, state: str, message: str, now: float):
+        """账号刚进入需要人工处理的暂停态（每次状态切换一次，另有冷却）。"""
+        label = self._label(aid)
+        why = "需要图片验证码" if state == "captcha" else "登录失败（学号或密码有误）"
+        todo = "打开 autosign 页面，点“验证码登录”输入一次验证码。" if state == "captcha" \
+            else "打开 autosign 页面核对并修改密码后重新开启（勿反复重试，以免触发学校风控）。"
+        lines = [f"账号：{label}", f"状态：{why}", f"处理：{todo}", f"详情：{message}"]
+        nxt = db.one("SELECT name,start_ts FROM plans WHERE account_id=? AND status='pending' "
+                     "AND end_ts>=? ORDER BY start_ts LIMIT 1", (aid, now))
+        if nxt:
+            lines.append(f"下一节待签：《{nxt['name']}》{mdhm(nxt['start_ts'])} 开课")
+        notify.send(f"{aid}:paused:{state}", f"autosign：{label} {why}", "\n\n".join(lines),
+                    account_id=aid, cooldown=PAUSE_NOTICE_GAP)
+
+    def _remind_paused(self, acc, now: float):
+        """账号仍处于暂停态、且下一节课快开始：再提醒一次（暂停本身不致命，漏课才是）。"""
+        if now - acc["state_at"] < SOON_AFTER_PAUSE or not notify.configured():
+            return
+        aid = acc["id"]
+        first = db.one("SELECT start_ts,day FROM plans WHERE account_id=? AND status='pending' "
+                       "AND end_ts>=? AND start_ts<=? ORDER BY start_ts LIMIT 1",
+                       (aid, now, now + SOON_LEAD))
+        if not first:
+            return
+        names = [r["name"] for r in db.q(
+            "SELECT DISTINCT name FROM plans WHERE account_id=? AND status='pending' "
+            "AND ABS(start_ts-?)<=1 ORDER BY name", (aid, first["start_ts"]))]
+        when = "已开课" if first["start_ts"] <= now else f"{mdhm(first['start_ts'])} 开课"
+        body = "\n\n".join([
+            f"账号：{acc['label']} 仍处于暂停态，不会自动签到。",
+            "课程：" + "、".join(f"《{n}》" for n in names) + f"（{when}）",
+            "处理：现在打开 autosign 页面完成登录，或直接在 iClass 手动签到。"])
+        notify.send(f"{aid}:soon:{first['day']}:{int(first['start_ts'])}",
+                    f"autosign：{acc['label']} 暂停中，课程快开始", body,
+                    account_id=aid, cooldown=FAIL_NOTICE_GAP)
+
+    def _notify_failed(self, acc, plan, n: int, message: str):
+        """某节课重试耗尽/已无法再试，最终失败。同名同时段的多个班合并为一条。"""
+        label = acc["label"] if "label" in acc.keys() else self._label(acc["id"])
+        body = "\n\n".join([
+            f"账号：{label}",
+            f"课程：《{plan['name']}》{mdhm(plan['start_ts'])} 开课",
+            f"已尝试：{n} 次，均未成功",
+            f"最后原因：{message}",
+            "处理：请在 iClass 手动签到；若反复出现，把上面的原因发给开发者排查。"])
+        notify.send(f"{acc['id']}:failed:{plan['day']}:{' '.join(plan['name'].split())}:{int(plan['start_ts'])}",
+                    f"autosign：《{plan['name']}》签到失败", body,
+                    account_id=acc["id"], cooldown=FAIL_NOTICE_GAP)
 
     # ---------- 登录与调用 ----------
     def _ensure_login(self, acc, r: Runner):
@@ -280,12 +345,7 @@ class Manager:
                 db.x("UPDATE plans SET status='pending',message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
                      (e.message, time.time(), *key))
                 raise
-            t = time.time()
-            retry = n < MAX_ATTEMPTS and t < plan["end_ts"]
-            db.x("UPDATE plans SET status=?,planned_at=?,message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
-                 ("pending" if retry else "failed", t + retry_delay(t, plan["start_ts"]),
-                  e.message, t, *key))
-            db.event(aid, "sign", f"《{plan['name']}》未能提交（第 {n} 次）：{e.message}")
+            self._rejected(acc, plan, key, n, e.message, f"《{plan['name']}》未能提交（第 {n} 次）：{e.message}")
             return
         now = time.time()
         if res.status == "success":
@@ -293,15 +353,25 @@ class Manager:
                  (res.message, now, *key))
             db.event(aid, "sign", f"《{plan['name']}》签到成功（{hms(now)}）")
         elif res.status == "failed":
-            retry = n < MAX_ATTEMPTS and now < plan["end_ts"]
-            db.x("UPDATE plans SET status=?,planned_at=?,message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
-                 ("pending" if retry else "failed", now + retry_delay(now, plan["start_ts"]),
-                  res.message, now, *key))
-            db.event(aid, "sign", f"《{plan['name']}》签到被拒（第 {n} 次）：{res.message}")
+            self._rejected(acc, plan, key, n, res.message, f"《{plan['name']}》签到被拒（第 {n} 次）：{res.message}")
         else:
             db.x("UPDATE plans SET status='unknown',message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
                  (res.message, now, *key))
             db.event(aid, "sign", f"《{plan['name']}》结果未知：{res.message}")
+
+    def _rejected(self, acc, plan, key, n: int, message: str, event_text: str):
+        """学校明确拒绝（或这次没能提交）：能再试就排下一次，否则判最终失败并通知。
+
+        下一次尝试若已晚于下课（那次永远不会执行），也直接判失败，而不是停在 pending。
+        """
+        now = time.time()
+        nxt = now + retry_delay(now, plan["start_ts"])
+        retry = n < MAX_ATTEMPTS and nxt < plan["end_ts"]
+        db.x("UPDATE plans SET status=?,planned_at=?,message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
+             ("pending" if retry else "failed", nxt, message, now, *key))
+        db.event(acc["id"], "sign", event_text)
+        if not retry:
+            self._notify_failed(acc, plan, n, message)
 
     # ---------- 人工输入验证码登录 ----------
     def captcha_begin(self, aid: int) -> dict:
