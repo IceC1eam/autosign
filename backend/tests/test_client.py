@@ -363,6 +363,25 @@ class SignTests(unittest.TestCase):
         c, _ = self.make(lambda: resp(200, json.dumps({"STATUS": "1"}), {"Content-Type": "application/json"}))
         self.assertEqual(c.sign(self.day, "5").status, "failed")
 
+    def test_business_failure_surfaces_school_reason(self):
+        # 回归（2026-11-19）：学校的字段是 ERRCODE/ERRMSG，旧版只认 ERRORMSG 等，拒绝原因被吞掉
+        body = {"STATUS": "1", "ERRCODE": "7", "ERRMSG": "签到未开始"}
+        c, st = self.make(lambda: resp(200, json.dumps(body), {"Content-Type": "application/json"}))
+        r = c.sign(self.day, "5")
+        self.assertEqual(r.status, "failed")
+        self.assertIn("ERRCODE=7", r.message)
+        self.assertIn("签到未开始", r.message)
+        self.assertEqual(st["sign_posts"], 1)        # 原因可见不等于重发：仍只 POST 一次
+
+    def test_business_failure_reason_is_sanitized_and_bounded(self):
+        body = {"STATUS": "1", "ERRMSG": "x\n\t" + "长" * 500, "ERRCODE": {"nested": "no"}}
+        c, _ = self.make(lambda: resp(200, json.dumps(body), {"Content-Type": "application/json"}))
+        r = c.sign(self.day, "5")
+        self.assertEqual(r.status, "failed")
+        self.assertNotIn("\n", r.message)
+        self.assertNotIn("ERRCODE=", r.message)      # 非标量不写入
+        self.assertLess(len(r.message), 260)
+
     def test_already_signed_no_post(self):
         c, st = self.make(lambda: resp(500), signed_before=1)
         self.assertEqual(c.sign(self.day, "5").status, "success")

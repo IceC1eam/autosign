@@ -24,7 +24,7 @@ log = logging.getLogger("autosign.scheduler")
 
 WINDOW_LEAD = 600          # 课前 10 分钟
 TICK = 5                   # 调度循环间隔（秒）
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 12          # 单节课最多提交次数；只在学校明确拒绝/未能提交后才重试，响应不明确绝不重放
 PAUSED_STATES = ("auth_failed", "captcha")
 CAPTCHA_TTL = 180          # 取到验证码后多久内必须提交（秒）
 CAPTCHA_GAP = 3            # 同一账号两次取验证码的最小间隔（秒）
@@ -32,6 +32,17 @@ CAPTCHA_GAP = 3            # 同一账号两次取验证码的最小间隔（秒
 
 def hms(ts: float) -> str:
     return datetime.fromtimestamp(ts, CHINA).strftime("%H:%M:%S")
+
+
+def retry_delay(now: float, start_ts: float) -> float:
+    """被拒后到下一次尝试的间隔（秒，含随机抖动）。
+
+    开课前约每分钟一次；开课后放宽到 2–3 分钟一次。配合 MAX_ATTEMPTS，重试能覆盖
+    约 15–20 分钟（旧版固定 45–75 秒 × 5 次，只覆盖约 5 分钟，窗口实际开到下课却被提前判失败）。
+    """
+    if now < start_ts:
+        return 45 + random.random() * 30
+    return 120 + random.random() * 60
 
 
 class Runner:
@@ -269,10 +280,11 @@ class Manager:
                 db.x("UPDATE plans SET status='pending',message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
                      (e.message, time.time(), *key))
                 raise
-            retry = n < MAX_ATTEMPTS and time.time() < plan["end_ts"]
+            t = time.time()
+            retry = n < MAX_ATTEMPTS and t < plan["end_ts"]
             db.x("UPDATE plans SET status=?,planned_at=?,message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
-                 ("pending" if retry else "failed", time.time() + 45 + random.random() * 30,
-                  e.message, time.time(), *key))
+                 ("pending" if retry else "failed", t + retry_delay(t, plan["start_ts"]),
+                  e.message, t, *key))
             db.event(aid, "sign", f"《{plan['name']}》未能提交（第 {n} 次）：{e.message}")
             return
         now = time.time()
@@ -283,7 +295,8 @@ class Manager:
         elif res.status == "failed":
             retry = n < MAX_ATTEMPTS and now < plan["end_ts"]
             db.x("UPDATE plans SET status=?,planned_at=?,message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
-                 ("pending" if retry else "failed", now + 45 + random.random() * 30, res.message, now, *key))
+                 ("pending" if retry else "failed", now + retry_delay(now, plan["start_ts"]),
+                  res.message, now, *key))
             db.event(aid, "sign", f"《{plan['name']}》签到被拒（第 {n} 次）：{res.message}")
         else:
             db.x("UPDATE plans SET status='unknown',message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",

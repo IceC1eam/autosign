@@ -95,6 +95,14 @@ def _pick(d: dict, *keys, default=""):
     return default
 
 
+def _short(v, limit: int = 120) -> str:
+    """学校返回的提示文本：只收标量，去控制字符与首尾空白并截断（会进事件/日志，不能无限长）。"""
+    if isinstance(v, (dict, list, tuple, set)) or v is None:
+        return ""
+    s = "".join(ch if ch.isprintable() else " " for ch in str(v)).strip()
+    return s[:limit]
+
+
 def _parse_time(v) -> datetime:
     s = str(v).strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
@@ -393,10 +401,14 @@ class Client:
         if str(payload.get("STATUS")) != "0" and not (
                 empty_status and str(payload.get("STATUS")) == empty_status
                 and not payload.get("result")):
-            msg = _pick(payload, "ERRORMSG", "errorMsg", "message", default="")
+            # 学校实际返回的字段是 ERRCODE / ERRMSG；其余写法是旧版/其他接口的兼容
+            msg = _short(_pick(payload, "ERRMSG", "ERRORMSG", "errorMsg", "errMsg", "message", default=""))
+            code = _short(_pick(payload, "ERRCODE", "errCode", "errorCode", default=""), 40)
             keys = ",".join(sorted(payload))[:80]
+            extra = f"，ERRCODE={code}" if code else ""
             raise ClientError("business",
-                              f"iClass 返回错误（STATUS={payload.get('STATUS')}，字段：{keys}）{msg}")
+                              f"iClass 返回错误（STATUS={payload.get('STATUS')}{extra}，字段：{keys}）"
+                              + (f"：{msg}" if msg else ""))
         return payload
 
     def schedules(self, day: date) -> list[Lesson]:

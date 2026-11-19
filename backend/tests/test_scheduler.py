@@ -18,6 +18,7 @@ class FakeClient:
     captcha_image: tuple | None = (b"\x89PNGfake", "image/png")   # None = 学校当前不要求验证码
     finish_error: ClientError | None = None
     finished: list = []
+    sign_result: SignResult | None = None   # 非 None 时 sign() 返回它（如被拒）
 
     def __init__(self):
         self._in = False
@@ -48,6 +49,8 @@ class FakeClient:
 
     def sign(self, day, lid):
         FakeClient.signs.append(lid)
+        if FakeClient.sign_result is not None:     # 模拟学校拒绝等：不改变课程签到状态
+            return FakeClient.sign_result
         FakeClient.lessons[lid].sign_status = 1
         return SignResult("success", "签到成功")
 
@@ -65,6 +68,7 @@ class SchedulerTests(unittest.TestCase):
             os.remove(os.path.join(TMP, f))
         FakeClient.lessons, FakeClient.signs, FakeClient.login_error = {}, [], None
         FakeClient.captcha_image, FakeClient.finish_error, FakeClient.finished = (b"\x89PNGfake", "image/png"), None, []
+        FakeClient.sign_result = None
         self._orig = scheduler.Client
         scheduler.Client = FakeClient
         self.m = scheduler.Manager()
@@ -100,6 +104,53 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.plan("1")["status"], "signed")
         self.run_job(); self.run_job()
         self.assertEqual(FakeClient.signs, ["1"])
+
+    def reject_once(self):
+        """让到点的计划立刻到期并执行一次（学校拒绝），返回执行后的计划行。"""
+        db.x("UPDATE plans SET planned_at=?", (time.time() - 1,))
+        self.run_job()
+        return self.plan("1")
+
+    def test_retry_delay_dense_before_start_sparse_after(self):
+        now = time.time()
+        for _ in range(50):
+            self.assertTrue(45 <= scheduler.retry_delay(now, now + 300) <= 75)    # 开课前
+            self.assertTrue(120 <= scheduler.retry_delay(now, now - 60) <= 180)   # 开课后
+        self.assertGreaterEqual(scheduler.MAX_ATTEMPTS, 10)
+
+    def test_rejection_keeps_retrying_beyond_old_five_attempt_limit(self):
+        # 回归（2026-11-19）：学校连续拒绝时，旧版 5 次后永久判失败，而窗口实际开到下课
+        FakeClient.sign_result = SignResult("failed", "iClass 返回错误（STATUS=1）")
+        FakeClient.lessons = {"1": lesson("1", 5)}
+        self.run_job()                                  # 建计划
+        for n in range(1, 8):
+            p = self.reject_once()
+            self.assertEqual(p["attempts"], n)
+            self.assertEqual(p["status"], "pending", f"第 {n} 次被拒后仍应继续重试")
+        self.assertEqual(len(FakeClient.signs), 7)
+        # 开课前被拒：下一次约 45–75 秒后
+        p = self.plan("1")
+        self.assertTrue(40 <= p["planned_at"] - p["updated"] <= 80)
+
+    def test_rejection_gives_up_at_max_attempts(self):
+        FakeClient.sign_result = SignResult("failed", "iClass 返回错误（STATUS=1）")
+        FakeClient.lessons = {"1": lesson("1", 5)}
+        self.run_job()
+        for _ in range(scheduler.MAX_ATTEMPTS):
+            p = self.reject_once()
+        self.assertEqual(p["attempts"], scheduler.MAX_ATTEMPTS)
+        self.assertEqual(p["status"], "failed")
+        before = len(FakeClient.signs)
+        self.run_job(); self.run_job()
+        self.assertEqual(len(FakeClient.signs), before)   # 判失败后不再提交
+
+    def test_rejection_after_class_start_backs_off(self):
+        FakeClient.sign_result = SignResult("failed", "iClass 返回错误（STATUS=1）")
+        FakeClient.lessons = {"1": lesson("1", -3)}     # 已开课 3 分钟，窗口仍开
+        self.run_job()
+        p = self.reject_once()
+        self.assertEqual(p["status"], "pending")
+        self.assertTrue(115 <= p["planned_at"] - p["updated"] <= 185)
 
     def test_enable_signs_immediately_if_window_open(self):
         FakeClient.lessons = {"1": lesson("1", 4), "2": lesson("2", 120), "3": lesson("3", -30)}
