@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
 from . import crypto, db, notify
-from .iclass import CHINA, Client, ClientError, SessionExpired, now_china
+from .iclass import CHINA, SIGN_VARIANTS, Client, ClientError, SessionExpired, now_china
 
 log = logging.getLogger("autosign.scheduler")
 
@@ -338,22 +338,26 @@ class Manager:
         db.x("UPDATE plans SET attempts=?,message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
              (n, "提交中", time.time(), *key))
         day = date.fromisoformat(plan["day"])
+        # 请求写法轮换：第 1 次用 eschool，被明确拒绝后下一次换 legacy，如此交替（事件里标注，便于判断哪种有效）
+        variant = SIGN_VARIANTS[(n - 1) % len(SIGN_VARIANTS)]
         try:
-            res = self.call(acc, r, lambda c: c.sign(day, plan["lesson_id"]), False)
+            res = self.call(acc, r, lambda c: c.sign(day, plan["lesson_id"], variant), False)
         except ClientError as e:
             if e.kind in ("auth", "captcha"):
                 db.x("UPDATE plans SET status='pending',message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
                      (e.message, time.time(), *key))
                 raise
-            self._rejected(acc, plan, key, n, e.message, f"《{plan['name']}》未能提交（第 {n} 次）：{e.message}")
+            self._rejected(acc, plan, key, n, e.message,
+                           f"《{plan['name']}》未能提交（第 {n} 次，{variant}）：{e.message}")
             return
         now = time.time()
         if res.status == "success":
             db.x("UPDATE plans SET status='signed',message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
                  (res.message, now, *key))
-            db.event(aid, "sign", f"《{plan['name']}》签到成功（{hms(now)}）")
+            db.event(aid, "sign", f"《{plan['name']}》签到成功（{hms(now)}，{variant}）")
         elif res.status == "failed":
-            self._rejected(acc, plan, key, n, res.message, f"《{plan['name']}》签到被拒（第 {n} 次）：{res.message}")
+            self._rejected(acc, plan, key, n, res.message,
+                           f"《{plan['name']}》签到被拒（第 {n} 次，{variant}）：{res.message}")
         else:
             db.x("UPDATE plans SET status='unknown',message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
                  (res.message, now, *key))

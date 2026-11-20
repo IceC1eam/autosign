@@ -32,6 +32,10 @@ PORTAL_CALLBACK = "https://d.buaa.edu.cn/login?cas_login=true"
 ICLASS_ENTRY = "https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter"
 API = "https://iclass.buaa.edu.cn:8347"
 SIGN_API = "http://iclass.buaa.edu.cn:8081"
+# 签到请求的两种写法（2026-11-19 起旧写法被学校拒绝：ERRCODE=101 “签到失败！”）：
+#   eschool：/eschool/ 路径 + Sessionid 头为 loginName + id 在 URL 查询参数里（与可用的第三方 duaa 一致）
+#   legacy ：旧路径 + Sessionid 头为登录返回的 sessionId + id 在表单体里
+SIGN_VARIANTS = ("eschool", "legacy")
 
 
 class ClientError(Exception):
@@ -371,10 +375,11 @@ class Client:
 
     # ---------- 业务接口 ----------
     def _api(self, method: str, logical: str, *, params=None, data=None,
-             auth: bool = True, retry: bool = False, empty_status: str = "") -> dict:
+             auth: bool = True, retry: bool = False, empty_status: str = "",
+             sid: str | None = None) -> dict:
         if auth and not self.logged_in:
             raise SessionExpired("尚未登录 iClass")
-        headers = {"Sessionid": self.session_id} if auth else {}
+        headers = {"Sessionid": sid or self.session_id} if auth else {}
         gw = webvpn.gateway_url(logical)
         attempts = 3 if retry else 1
         for i in range(attempts):
@@ -437,7 +442,9 @@ class Client:
     def _find(self, day: date, lesson_id: str) -> Lesson | None:
         return next((x for x in self.schedules(day) if x.id == lesson_id), None)
 
-    def sign(self, day: date, lesson_id: str) -> SignResult:
+    def sign(self, day: date, lesson_id: str, variant: str = "eschool") -> SignResult:
+        if variant not in SIGN_VARIANTS:
+            raise ClientError("input", "未知的签到请求写法")
         # 1. 重新查询最新安排
         lesson = self._find(day, lesson_id)
         if lesson is None:
@@ -454,10 +461,16 @@ class Client:
         if not lesson.window_open(now_china()):
             raise ClientError("business", "当前不在可签到时间（课前 10 分钟至课程结束）")
         try:
-            payload = self._api(
-                "POST", f"{SIGN_API}/app/course/stu_scan_sign.action",
-                params={"courseSchedId": lesson.id, "timestamp": ts},
-                data={"id": self.user_id}, retry=False)
+            if variant == "eschool":
+                payload = self._api(
+                    "POST", f"{SIGN_API}/eschool/app/course/stu_scan_sign.action",
+                    params={"id": self.user_id, "courseSchedId": lesson.id, "timestamp": ts},
+                    sid=self.login_name, retry=False)
+            else:
+                payload = self._api(
+                    "POST", f"{SIGN_API}/app/course/stu_scan_sign.action",
+                    params={"courseSchedId": lesson.id, "timestamp": ts},
+                    data={"id": self.user_id}, retry=False)
         except ClientError as e:
             if e.kind == "business":
                 return SignResult("failed", e.message)

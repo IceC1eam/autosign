@@ -33,6 +33,8 @@
 5. `GET` `https://iclass.buaa.edu.cn:8347/app/user/login.action?phone=<loginName>&verificationType=2&userLevel=1&password=&verificationUrl=` → `result.id`、`result.sessionId`。若用学号代替 loginName，会得到 `STATUS=1`。
 6. 业务接口：`Sessionid` 请求头 + `id` 参数；签到走 `http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action`（POST，`courseSchedId`/`timestamp` 在查询参数，`id` 在表单体）。
 
+7. **签到请求有两种写法**（`iclass.SIGN_VARIANTS`）：`eschool`（默认）= `http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action?id=<userId>&courseSchedId=&timestamp=`，`Sessionid` 头用 **loginName**（第 4 步 URL 里的长串），无表单体；`legacy` = 旧路径 `/app/course/stu_scan_sign.action`，`Sessionid` 头用登录返回的 `sessionId`，`id` 在表单体。2026-11-19 起学校对 legacy 回 `ERRCODE=101 签到失败！`（读课表/取时间戳的旧写法仍可用），而第三方 duaa（`/eschool/` + loginName，浏览器直连）可用；调度器第 1 次用 eschool、被明确拒绝后下一次换 legacy 轮换，事件里标注所用写法（“第 n 次，eschool”），据此判断哪种有效。登录仍是 `8347/app/user/login.action`；若 eschool 仍被拒，下一步是改用 duaa 的 `8346/eschool/app/user/login_buaa.do`。
+
 排障方法：登录失败时，“最近动态”或 `GET /autosign/api/accounts/{id}/schedule` 的错误里带有脱敏轨迹（`方法 目标路径?[参数名] -> 状态 => 下一跳`）。对照上面流程找出哪一跳被拒/断，再决定是放行新的门户路径（加到 `PORTAL_PATHS`，要保持最小放行）还是修解析。**不要**为了省事放开任意 `d.buaa.edu.cn` 路径或任意主机。
 
 ---

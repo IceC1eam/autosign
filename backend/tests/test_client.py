@@ -329,15 +329,48 @@ class SignTests(unittest.TestCase):
             if "stu_scan_sign" in logical:
                 state["sign_posts"] += 1
                 self.assertEqual(m, "POST")
-                self.assertEqual(k["data"], {"id": "99"})
-                self.assertEqual(k["params"]["courseSchedId"], "5")
-                self.assertEqual(k["headers"]["Sessionid"], "S")
+                state["req"] = (logical, k)
                 return sign_resp()
             return resp(404)
         http = FakeHTTP(route)
         c = Client(http)
-        c.user_id, c.session_id = "99", "S"
+        c.user_id, c.session_id, c.login_name = "99", "S", "LN-long-login-name"
         return c, state
+
+    def test_default_variant_is_eschool_like_duaa(self):
+        c, st = self.make(lambda: resp(200, json.dumps(
+            {"STATUS": "0", "result": {"stuSignStatus": 1}}), {"Content-Type": "application/json"}))
+        self.assertEqual(c.sign(self.day, "5").status, "success")
+        logical, k = st["req"]
+        self.assertEqual(logical, "http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action")
+        self.assertEqual(k["params"], {"id": "99", "courseSchedId": "5", "timestamp": "1760000000000"})
+        self.assertIsNone(k.get("data"))                              # id 在 URL 里，不在表单体
+        self.assertEqual(k["headers"]["Sessionid"], "LN-long-login-name")   # 用 loginName，不是 sessionId
+
+    def test_legacy_variant_keeps_old_request_shape(self):
+        c, st = self.make(lambda: resp(200, json.dumps(
+            {"STATUS": "0", "result": {"stuSignStatus": 1}}), {"Content-Type": "application/json"}))
+        self.assertEqual(c.sign(self.day, "5", "legacy").status, "success")
+        logical, k = st["req"]
+        self.assertEqual(logical, "http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action")
+        self.assertEqual(k["params"], {"courseSchedId": "5", "timestamp": "1760000000000"})
+        self.assertEqual(k["data"], {"id": "99"})
+        self.assertEqual(k["headers"]["Sessionid"], "S")
+
+    def test_unknown_variant_rejected_without_any_request(self):
+        c, st = self.make(lambda: resp(500))
+        with self.assertRaises(ClientError):
+            c.sign(self.day, "5", "bogus")
+        self.assertEqual(st["sign_posts"], 0)
+
+    def test_both_variants_still_post_only_once_per_call(self):
+        for v in ("eschool", "legacy"):
+            c, st = self.make(lambda: resp(200, json.dumps({"STATUS": "1", "ERRCODE": "101", "ERRMSG": "签到失败！"}),
+                                           {"Content-Type": "application/json"}))
+            r = c.sign(self.day, "5", v)
+            self.assertEqual(r.status, "failed")
+            self.assertIn("ERRCODE=101", r.message)
+            self.assertEqual(st["sign_posts"], 1, v)
 
     def test_success(self):
         c, st = self.make(lambda: resp(200, json.dumps(
