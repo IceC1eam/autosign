@@ -338,7 +338,7 @@ class Manager:
         db.x("UPDATE plans SET attempts=?,message=?,updated=? WHERE account_id=? AND day=? AND lesson_id=?",
              (n, "提交中", time.time(), *key))
         day = date.fromisoformat(plan["day"])
-        # 请求写法轮换：第 1 次用 eschool，被明确拒绝后下一次换 legacy，如此交替（事件里标注，便于判断哪种有效）
+        # 请求写法轮换：第 1 次用 vpn8347（WebVPN 标准路径），被明确拒绝后下一次换 eschool，如此交替（事件里标注）
         variant = SIGN_VARIANTS[(n - 1) % len(SIGN_VARIANTS)]
         try:
             res = self.call(acc, r, lambda c: c.sign(day, plan["lesson_id"], variant), False)

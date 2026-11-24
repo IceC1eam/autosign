@@ -30,10 +30,12 @@
 2. `POST` 表单到网关 SSO → 302 → 门户 `/login?cas_login&ticket`（网关会把它改写成“经网关访问 d.buaa.edu.cn 自己”的形式，主机编码解出来是 `d.buaa.edu.cn`，**仅放行** `/login`、`/logout`、`/wengine-vpn-token-login`、`/token-login`）。
 3. → `/wengine-vpn-token-login?token` → `/token-login?token` → 门户首页 `/`（到首页即停止，不抓取）。此后 CookieJar 才有网关会话。
 4. `GET` iClass `https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter` → SSO（已登录）→ 带 ticket 回到 8346 → 若干 302 → 某一跳的 Location 含 `loginName=<长串>`（**不是学号**，且很长；取 `\S{1,512}`），最终 200。
-5. `GET` `https://iclass.buaa.edu.cn:8347/app/user/login.action?phone=<loginName>&verificationType=2&userLevel=1&password=&verificationUrl=` → `result.id`、`result.sessionId`。若用学号代替 loginName，会得到 `STATUS=1`。
-6. 业务接口：`Sessionid` 请求头 + `id` 参数；签到走 `http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action`（POST，`courseSchedId`/`timestamp` 在查询参数，`id` 在表单体）。
-
-7. **签到请求有两种写法**（`iclass.SIGN_VARIANTS`）：`eschool`（默认）= `http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action?id=<userId>&courseSchedId=&timestamp=`，`Sessionid` 头用 **loginName**（第 4 步 URL 里的长串），无表单体；`legacy` = 旧路径 `/app/course/stu_scan_sign.action`，`Sessionid` 头用登录返回的 `sessionId`，`id` 在表单体。2026-11-19 起学校对 legacy 回 `ERRCODE=101 签到失败！`（读课表/取时间戳的旧写法仍可用），而第三方 duaa（`/eschool/` + loginName，浏览器直连）可用；调度器第 1 次用 eschool、被明确拒绝后下一次换 legacy 轮换，事件里标注所用写法（“第 n 次，eschool”），据此判断哪种有效。登录仍是 `8347/app/user/login.action`；若 eschool 仍被拒，下一步是改用 duaa 的 `8346/eschool/app/user/login_buaa.do`。
+5. `GET` `https://iclass.buaa.edu.cn:8346/eschool/app/user/login_buaa.do?phone=<loginName>&verificationType=2&userLevel=1&password=&verificationUrl=` → `result.id`（参考 `fontlos/buaa-api` 与 `singledog957/duaa`）。若用学号代替 loginName，会得到 `STATUS=1`。
+6. 业务接口：所有接口统一 `POST`、`Sessionid` 请求头传 `loginName`、`id` 放在 URL 查询参数里；`STATUS=401`/`4001` 视为会话失效。
+7. **签到请求有两种写法**（`iclass.SIGN_VARIANTS`，均以 `loginName` 为 `Sessionid`、`id` 在 URL 查询参数、无表单体）：
+   - `vpn8347`（默认，参考 `fontlos/buaa-api` 的 WebVPN 模式）：`https://iclass.buaa.edu.cn:8347/app/course/stu_scan_sign.action`（无 `/eschool/` 前缀，时间戳也优先从 8347 取）；
+   - `eschool`（备选，校园网直连 `duaa` 的写法）：`http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action`（时间戳优先从 8081 取）。
+   2026-11-24 实测经 WebVPN 调 `8081/eschool/...` 与旧 `8081/app/...` 均被学校回 `ERRCODE=101 签到失败！`，因为 `8081/eschool/` 仅校园网直连可用，WebVPN 下签到与查询均走 `8347`。调度器第 1 次用 `vpn8347`，被明确拒绝后与 `eschool` 交替并在事件里标注。
 
 排障方法：登录失败时，“最近动态”或 `GET /autosign/api/accounts/{id}/schedule` 的错误里带有脱敏轨迹（`方法 目标路径?[参数名] -> 状态 => 下一跳`）。对照上面流程找出哪一跳被拒/断，再决定是放行新的门户路径（加到 `PORTAL_PATHS`，要保持最小放行）还是修解析。**不要**为了省事放开任意 `d.buaa.edu.cn` 路径或任意主机。
 

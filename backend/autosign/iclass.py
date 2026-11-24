@@ -29,13 +29,14 @@ SSO_CAPTCHA = "https://sso.buaa.edu.cn/captcha"
 _CAPTCHA_TYPES = {"image/png", "image/jpeg", "image/gif"}
 CAPTCHA_MSG = "统一认证要求图片验证码，请点“验证码登录”手动输入一次"
 PORTAL_CALLBACK = "https://d.buaa.edu.cn/login?cas_login=true"
-ICLASS_ENTRY = "https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter"
+ICLASS_LOGIN_API = "https://iclass.buaa.edu.cn:8346"
+ICLASS_ENTRY = f"{ICLASS_LOGIN_API}/?type=jumpMyCenter"
 API = "https://iclass.buaa.edu.cn:8347"
 SIGN_API = "http://iclass.buaa.edu.cn:8081"
-# 签到请求的两种写法（2026-11-19 起旧写法被学校拒绝：ERRCODE=101 “签到失败！”）：
-#   eschool：/eschool/ 路径 + Sessionid 头为 loginName + id 在 URL 查询参数里（与可用的第三方 duaa 一致）
-#   legacy ：旧路径 + Sessionid 头为登录返回的 sessionId + id 在表单体里
-SIGN_VARIANTS = ("eschool", "legacy")
+# 签到请求的两种写法（参考 fontlos/buaa-api 与 singledog957/duaa，Sessionid 头均为 loginName，id 在 URL 查询参数里）：
+#   vpn8347：WebVPN 模式（buaa-api）：https://iclass.buaa.edu.cn:8347/app/course/stu_scan_sign.action（无 /eschool/ 前缀）
+#   eschool：校园网模式（duaa / buaa-api）：http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action
+SIGN_VARIANTS = ("vpn8347", "eschool")
 
 
 class ClientError(Exception):
@@ -159,7 +160,7 @@ class Client:
     # ---------- 状态 ----------
     @property
     def logged_in(self) -> bool:
-        return bool(self.user_id and self.session_id)
+        return bool(self.user_id and (self.login_name or self.session_id))
 
     def clear(self):
         self.user_id = self.session_id = self.login_name = None
@@ -307,12 +308,13 @@ class Client:
                           f"页面含login相关字段={names}")
         params = {"phone": login_name, "verificationType": "2", "userLevel": "1",
                   "password": "", "verificationUrl": ""}
-        payload = self._api("GET", f"{API}/app/user/login.action", params=params,
-                            auth=False, retry=True)
+        payload = self._api("GET", f"{ICLASS_LOGIN_API}/eschool/app/user/login_buaa.do",
+                            params=params, auth=False, retry=True)
         res = payload.get("result")
-        if not isinstance(res, dict) or not res.get("id") or not res.get("sessionId"):
-            raise ClientError("protocol", "iClass 登录响应缺少 id/sessionId")
-        self.user_id, self.session_id = str(res["id"]), str(res["sessionId"])
+        if not isinstance(res, dict) or not res.get("id"):
+            raise ClientError("protocol", "iClass 登录响应缺少 id")
+        self.user_id = str(res["id"])
+        self.session_id = str(res.get("sessionId") or login_name)
 
     def login(self, number: str, password: str, captcha: str | None = None, page=None):
         if not re.fullmatch(r"[A-Za-z0-9]{4,20}", number or ""):
@@ -379,7 +381,7 @@ class Client:
              sid: str | None = None) -> dict:
         if auth and not self.logged_in:
             raise SessionExpired("尚未登录 iClass")
-        headers = {"Sessionid": sid or self.session_id} if auth else {}
+        headers = {"Sessionid": sid or self.login_name or self.session_id} if auth else {}
         gw = webvpn.gateway_url(logical)
         attempts = 3 if retry else 1
         for i in range(attempts):
@@ -403,6 +405,8 @@ class Client:
             raise ClientError("protocol", "iClass 响应不是有效 JSON") from None
         if not isinstance(payload, dict):
             raise ClientError("protocol", "iClass 响应结构异常")
+        if str(payload.get("STATUS")) in ("401", "4001"):
+            raise SessionExpired("iClass 会话已失效，请重新登录")
         if str(payload.get("STATUS")) != "0" and not (
                 empty_status and str(payload.get("STATUS")) == empty_status
                 and not payload.get("result")):
@@ -417,16 +421,18 @@ class Client:
         return payload
 
     def schedules(self, day: date) -> list[Lesson]:
-        payload = self._api("GET", f"{API}/app/course/get_stu_course_sched.action",
-                            params={"dateStr": day.strftime("%Y%m%d"), "id": self.user_id},
+        payload = self._api("POST", f"{API}/app/course/get_stu_course_sched.action",
+                            params={"id": self.user_id, "dateStr": day.strftime("%Y%m%d")},
                             retry=True, empty_status="2")  # 当天无课时 iClass 返回 STATUS=2 且无 result
         return parse_lessons(payload)
 
-    def _timestamp(self) -> str:
+    def _timestamp(self, prefer_api: bool = True) -> str:
         last: ClientError | None = None
-        for base in (API, SIGN_API):  # 只读、幂等，可依次尝试
+        bases = (API, SIGN_API) if prefer_api else (SIGN_API, API)
+        for base in bases:  # 只读、幂等，优先与签到目标同端口取时间戳避免时钟偏差
             try:
-                p = self._api("GET", f"{base}/app/common/get_timestamp.action", retry=True)
+                p = self._api("POST", f"{base}/app/common/get_timestamp.action",
+                              params={"id": self.user_id}, retry=True)
             except SessionExpired:
                 raise
             except ClientError as e:
@@ -442,7 +448,7 @@ class Client:
     def _find(self, day: date, lesson_id: str) -> Lesson | None:
         return next((x for x in self.schedules(day) if x.id == lesson_id), None)
 
-    def sign(self, day: date, lesson_id: str, variant: str = "eschool") -> SignResult:
+    def sign(self, day: date, lesson_id: str, variant: str = "vpn8347") -> SignResult:
         if variant not in SIGN_VARIANTS:
             raise ClientError("input", "未知的签到请求写法")
         # 1. 重新查询最新安排
@@ -456,21 +462,17 @@ class Client:
         if not lesson.window_open(now_china()):
             raise ClientError("business", "当前不在可签到时间（课前 10 分钟至课程结束）")
         # 2. 学校服务时间戳
-        ts = self._timestamp()
+        ts = self._timestamp(prefer_api=(variant == "vpn8347"))
         # 3. 再次检查时间，然后只提交一次
         if not lesson.window_open(now_china()):
             raise ClientError("business", "当前不在可签到时间（课前 10 分钟至课程结束）")
         try:
-            if variant == "eschool":
-                payload = self._api(
-                    "POST", f"{SIGN_API}/eschool/app/course/stu_scan_sign.action",
-                    params={"id": self.user_id, "courseSchedId": lesson.id, "timestamp": ts},
-                    sid=self.login_name, retry=False)
-            else:
-                payload = self._api(
-                    "POST", f"{SIGN_API}/app/course/stu_scan_sign.action",
-                    params={"courseSchedId": lesson.id, "timestamp": ts},
-                    data={"id": self.user_id}, retry=False)
+            url = (f"{API}/app/course/stu_scan_sign.action" if variant == "vpn8347"
+                   else f"{SIGN_API}/eschool/app/course/stu_scan_sign.action")
+            payload = self._api(
+                "POST", url,
+                params={"id": self.user_id, "courseSchedId": lesson.id, "timestamp": ts},
+                sid=self.login_name or self.session_id, retry=False)
         except ClientError as e:
             if e.kind == "business":
                 return SignResult("failed", e.message)

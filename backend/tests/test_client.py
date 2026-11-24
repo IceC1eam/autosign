@@ -94,13 +94,13 @@ class LoginBase(unittest.TestCase):
                 return resp(post_status, post_body or FORM)
             if method == "GET" and url.startswith("https://d.buaa.edu.cn/login?cas_login"):
                 return resp(302, headers={"Location": "/"})  # 门户首页：不应被抓取
+            if method == "GET" and logical and "/eschool/app/user/login_buaa.do" in logical:
+                return resp(200, json.dumps({"STATUS": "0", "result": {"id": "99"}}),
+                            {"Content-Type": "application/json"})
             if method == "GET" and logical and ":8346" in logical:
                 if "loginName=" in logical:
                     return resp(200, "<html>center</html>")
                 return resp(302, headers={"Location": url.replace("?type=jumpMyCenter", "") + "?loginName=20371234"})
-            if method == "GET" and logical and "/app/user/login.action" in logical:
-                return resp(200, json.dumps({"STATUS": "0", "result": {"id": "99", "sessionId": "S"}}),
-                            {"Content-Type": "application/json"})
             return resp(404)
         return route
 
@@ -114,7 +114,7 @@ class LoginTests(LoginBase):
         self.assertFalse([x for x in http.calls if x[1] == "https://d.buaa.edu.cn/"])
         self.assertTrue(any("gw:https://sso.buaa.edu.cn/login" in t for t in c.trace))
         self.assertFalse(any("ticket=" in t or "20371234" in t.replace("loginName 来源", "") for t in c.trace))
-        self.assertEqual((c.user_id, c.session_id, c.login_name), ("99", "S", "20371234"))
+        self.assertEqual((c.user_id, c.session_id, c.login_name), ("99", "20371234", "20371234"))
         posts = [x for x in http.calls if x[0] == "POST"]
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0][2]["data"]["execution"], "e1")
@@ -296,6 +296,13 @@ class ApiTests(unittest.TestCase):
                                                 {"Content-Type": "application/json"}))
         self.assertEqual(c.schedules(date(2026, 10, 18)), [])
 
+    def test_status_4001_means_session_expired(self):
+        for code in ("401", "4001"):
+            c, _ = self.client(lambda m, u, k, code=code: resp(
+                200, json.dumps({"STATUS": code}), {"Content-Type": "application/json"}))
+            with self.assertRaises(SessionExpired):
+                c.schedules(date(2026, 10, 18))
+
     def test_business_error_not_retried(self):
         n = {"i": 0}
 
@@ -325,6 +332,7 @@ class SignTests(unittest.TestCase):
                 s = signed_before if state["scheds"] == 1 else signed_after
                 return resp(200, json.dumps({"STATUS": "0", "result": [lesson("5", self.start, s)]}), js)
             if "get_timestamp" in logical:
+                state["ts_url"] = logical
                 return resp(200, json.dumps({"STATUS": "0", "timestamp": 1760000000000}), js)
             if "stu_scan_sign" in logical:
                 state["sign_posts"] += 1
@@ -337,25 +345,27 @@ class SignTests(unittest.TestCase):
         c.user_id, c.session_id, c.login_name = "99", "S", "LN-long-login-name"
         return c, state
 
-    def test_default_variant_is_eschool_like_duaa(self):
+    def test_default_variant_is_vpn8347_like_buaa_api(self):
         c, st = self.make(lambda: resp(200, json.dumps(
             {"STATUS": "0", "result": {"stuSignStatus": 1}}), {"Content-Type": "application/json"}))
         self.assertEqual(c.sign(self.day, "5").status, "success")
         logical, k = st["req"]
-        self.assertEqual(logical, "http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action")
+        self.assertEqual(st["ts_url"], "https://iclass.buaa.edu.cn:8347/app/common/get_timestamp.action")
+        self.assertEqual(logical, "https://iclass.buaa.edu.cn:8347/app/course/stu_scan_sign.action")
         self.assertEqual(k["params"], {"id": "99", "courseSchedId": "5", "timestamp": "1760000000000"})
         self.assertIsNone(k.get("data"))                              # id 在 URL 里，不在表单体
         self.assertEqual(k["headers"]["Sessionid"], "LN-long-login-name")   # 用 loginName，不是 sessionId
 
-    def test_legacy_variant_keeps_old_request_shape(self):
+    def test_eschool_variant_targets_8081_eschool(self):
         c, st = self.make(lambda: resp(200, json.dumps(
             {"STATUS": "0", "result": {"stuSignStatus": 1}}), {"Content-Type": "application/json"}))
-        self.assertEqual(c.sign(self.day, "5", "legacy").status, "success")
+        self.assertEqual(c.sign(self.day, "5", "eschool").status, "success")
         logical, k = st["req"]
-        self.assertEqual(logical, "http://iclass.buaa.edu.cn:8081/app/course/stu_scan_sign.action")
-        self.assertEqual(k["params"], {"courseSchedId": "5", "timestamp": "1760000000000"})
-        self.assertEqual(k["data"], {"id": "99"})
-        self.assertEqual(k["headers"]["Sessionid"], "S")
+        self.assertEqual(st["ts_url"], "http://iclass.buaa.edu.cn:8081/app/common/get_timestamp.action")
+        self.assertEqual(logical, "http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action")
+        self.assertEqual(k["params"], {"id": "99", "courseSchedId": "5", "timestamp": "1760000000000"})
+        self.assertIsNone(k.get("data"))
+        self.assertEqual(k["headers"]["Sessionid"], "LN-long-login-name")
 
     def test_unknown_variant_rejected_without_any_request(self):
         c, st = self.make(lambda: resp(500))
@@ -364,7 +374,7 @@ class SignTests(unittest.TestCase):
         self.assertEqual(st["sign_posts"], 0)
 
     def test_both_variants_still_post_only_once_per_call(self):
-        for v in ("eschool", "legacy"):
+        for v in ("vpn8347", "eschool"):
             c, st = self.make(lambda: resp(200, json.dumps({"STATUS": "1", "ERRCODE": "101", "ERRMSG": "签到失败！"}),
                                            {"Content-Type": "application/json"}))
             r = c.sign(self.day, "5", v)

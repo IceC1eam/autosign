@@ -48,7 +48,7 @@ class FakeClient:
     def schedules(self, day):
         return list(FakeClient.lessons.values())
 
-    def sign(self, day, lid, variant="eschool"):
+    def sign(self, day, lid, variant="vpn8347"):
         FakeClient.signs.append(lid)
         FakeClient.variants.append(variant)
         if FakeClient.sign_result is not None:     # 模拟学校拒绝等：不改变课程签到状态
@@ -148,19 +148,19 @@ class SchedulerTests(unittest.TestCase):
         self.run_job()
         for _ in range(5):
             self.reject_once()
-        self.assertEqual(FakeClient.variants, ["eschool", "legacy", "eschool", "legacy", "eschool"])
+        self.assertEqual(FakeClient.variants, ["vpn8347", "eschool", "vpn8347", "eschool", "vpn8347"])
         msgs = [r["message"] for r in db.q("SELECT message FROM events WHERE kind='sign' ORDER BY id")]
-        self.assertIn("第 1 次，eschool", msgs[0])
-        self.assertIn("第 2 次，legacy", msgs[1])
+        self.assertIn("第 1 次，vpn8347", msgs[0])
+        self.assertIn("第 2 次，eschool", msgs[1])
 
     def test_success_event_names_the_variant_that_worked(self):
         FakeClient.lessons = {"1": lesson("1", 5)}
         self.run_job()
         self.reject_once()
-        self.assertEqual(FakeClient.variants, ["eschool"])
+        self.assertEqual(FakeClient.variants, ["vpn8347"])
         msg = db.one("SELECT message FROM events WHERE kind='sign' ORDER BY id DESC")["message"]
         self.assertIn("签到成功", msg)
-        self.assertIn("eschool", msg)
+        self.assertIn("vpn8347", msg)
 
     def test_rejection_gives_up_at_max_attempts(self):
         FakeClient.sign_result = SignResult("failed", "iClass 返回错误（STATUS=1）")
