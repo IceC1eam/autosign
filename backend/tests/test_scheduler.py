@@ -148,10 +148,11 @@ class SchedulerTests(unittest.TestCase):
         self.run_job()
         for _ in range(5):
             self.reject_once()
-        self.assertEqual(FakeClient.variants, ["vpn8347", "eschool", "vpn8347", "eschool", "vpn8347"])
+        self.assertEqual(FakeClient.variants, ["vpn8347", "vpn8347_eschool", "eschool", "vpn8347", "vpn8347_eschool"])
         msgs = [r["message"] for r in db.q("SELECT message FROM events WHERE kind='sign' ORDER BY id")]
         self.assertIn("第 1 次，vpn8347", msgs[0])
-        self.assertIn("第 2 次，eschool", msgs[1])
+        self.assertIn("第 2 次，vpn8347_eschool", msgs[1])
+        self.assertIn("第 3 次，eschool", msgs[2])
 
     def test_success_event_names_the_variant_that_worked(self):
         FakeClient.lessons = {"1": lesson("1", 5)}

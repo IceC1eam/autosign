@@ -356,6 +356,15 @@ class SignTests(unittest.TestCase):
         self.assertIsNone(k.get("data"))                              # id 在 URL 里，不在表单体
         self.assertEqual(k["headers"]["Sessionid"], "LN-long-login-name")   # 用 loginName，不是 sessionId
 
+    def test_vpn8347_eschool_variant_targets_8347_eschool(self):
+        c, st = self.make(lambda: resp(200, json.dumps(
+            {"STATUS": "0", "result": {"stuSignStatus": 1}}), {"Content-Type": "application/json"}))
+        self.assertEqual(c.sign(self.day, "5", "vpn8347_eschool").status, "success")
+        logical, k = st["req"]
+        self.assertEqual(st["ts_url"], "https://iclass.buaa.edu.cn:8347/app/common/get_timestamp.action")
+        self.assertEqual(logical, "https://iclass.buaa.edu.cn:8347/eschool/app/course/stu_scan_sign.action")
+        self.assertEqual(k["headers"]["Sessionid"], "LN-long-login-name")
+
     def test_eschool_variant_targets_8081_eschool(self):
         c, st = self.make(lambda: resp(200, json.dumps(
             {"STATUS": "0", "result": {"stuSignStatus": 1}}), {"Content-Type": "application/json"}))
@@ -374,12 +383,14 @@ class SignTests(unittest.TestCase):
         self.assertEqual(st["sign_posts"], 0)
 
     def test_both_variants_still_post_only_once_per_call(self):
-        for v in ("vpn8347", "eschool"):
+        for v in ("vpn8347", "vpn8347_eschool", "eschool"):
             c, st = self.make(lambda: resp(200, json.dumps({"STATUS": "1", "ERRCODE": "101", "ERRMSG": "签到失败！"}),
                                            {"Content-Type": "application/json"}))
             r = c.sign(self.day, "5", v)
             self.assertEqual(r.status, "failed")
             self.assertIn("ERRCODE=101", r.message)
+            self.assertIn("ts=", r.message)
+            self.assertNotIn("LN-long-login-name", r.message)   # 诊断信息不得泄露 loginName 原值
             self.assertEqual(st["sign_posts"], 1, v)
 
     def test_success(self):

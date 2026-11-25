@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qs, quote, urlsplit
@@ -33,10 +34,11 @@ ICLASS_LOGIN_API = "https://iclass.buaa.edu.cn:8346"
 ICLASS_ENTRY = f"{ICLASS_LOGIN_API}/?type=jumpMyCenter"
 API = "https://iclass.buaa.edu.cn:8347"
 SIGN_API = "http://iclass.buaa.edu.cn:8081"
-# 签到请求的两种写法（参考 fontlos/buaa-api 与 singledog957/duaa，Sessionid 头均为 loginName，id 在 URL 查询参数里）：
-#   vpn8347：WebVPN 模式（buaa-api）：https://iclass.buaa.edu.cn:8347/app/course/stu_scan_sign.action（无 /eschool/ 前缀）
-#   eschool：校园网模式（duaa / buaa-api）：http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action
-SIGN_VARIANTS = ("vpn8347", "eschool")
+# 签到请求的三种写法（参考 fontlos/buaa-api 与 singledog957/duaa，Sessionid 头均为 loginName，id 在 URL 查询参数里）：
+#   vpn8347        ：WebVPN 模式（buaa-api）：https://iclass.buaa.edu.cn:8347/app/course/stu_scan_sign.action
+#   vpn8347_eschool：8347 端口带 /eschool/ 前缀：https://iclass.buaa.edu.cn:8347/eschool/app/course/stu_scan_sign.action
+#   eschool        ：校园网模式（duaa / buaa-api）：http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action
+SIGN_VARIANTS = ("vpn8347", "vpn8347_eschool", "eschool")
 
 
 class ClientError(Exception):
@@ -154,6 +156,7 @@ class Client:
         self.user_id: str | None = None
         self.session_id: str | None = None
         self.login_name: str | None = None
+        self.login_name_from: str = "未知"
         self.trace: list[str] = []
         self._page: tuple[str, str, dict] | None = None   # begin_captcha_login 留下的登录页
 
@@ -164,6 +167,7 @@ class Client:
 
     def clear(self):
         self.user_id = self.session_id = self.login_name = None
+        self.login_name_from = "未知"
         self.http.cookies.clear()
 
     # ---------- 底层 ----------
@@ -303,6 +307,7 @@ class Client:
         found = self._find_login_name(r, trail)
         login_name = found or number
         self.login_name = login_name
+        self.login_name_from = "URL" if found else "学号"
         names = sorted(set(re.findall(r"[\"']?([A-Za-z]*[Ll]ogin[A-Za-z]*)[\"']?\s*[:=]", r.text or "")))[:8]
         self.trace.append(f"loginName 来源={'URL/页面' if found else '回退为学号'}；页面长度={len(r.text or '')}；"
                           f"页面含login相关字段={names}")
@@ -426,10 +431,11 @@ class Client:
                             retry=True, empty_status="2")  # 当天无课时 iClass 返回 STATUS=2 且无 result
         return parse_lessons(payload)
 
-    def _timestamp(self, prefer_api: bool = True) -> str:
+    def _timestamp(self, prefer_api: bool = True) -> tuple[str, str, int]:
         last: ClientError | None = None
-        bases = (API, SIGN_API) if prefer_api else (SIGN_API, API)
-        for base in bases:  # 只读、幂等，优先与签到目标同端口取时间戳避免时钟偏差
+        bases = ((API, "8347"), (SIGN_API, "8081")) if prefer_api else ((SIGN_API, "8081"), (API, "8347"))
+        for base, port in bases:  # 只读、幂等，优先与签到目标同端口取时间戳避免时钟偏差
+            t0 = time.monotonic()
             try:
                 p = self._api("POST", f"{base}/app/common/get_timestamp.action",
                               params={"id": self.user_id}, retry=True)
@@ -438,10 +444,11 @@ class Client:
             except ClientError as e:
                 last = e
                 continue
+            rtt_ms = int((time.monotonic() - t0) * 1000)
             res = p.get("result")
             cand = p.get("timestamp", res.get("timestamp") if isinstance(res, dict) else res)
             if cand is not None and re.fullmatch(r"\d{10,16}", str(cand)):
-                return str(cand)
+                return str(cand), port, rtt_ms
             last = ClientError("protocol", "时间戳格式异常")
         raise last or ClientError("protocol", "无法获取时间戳")
 
@@ -462,20 +469,30 @@ class Client:
         if not lesson.window_open(now_china()):
             raise ClientError("business", "当前不在可签到时间（课前 10 分钟至课程结束）")
         # 2. 学校服务时间戳
-        ts = self._timestamp(prefer_api=(variant == "vpn8347"))
+        ts, ts_port, ts_rtt = self._timestamp(prefer_api=(variant != "eschool"))
+        now_ms = int(time.time() * 1000)
+        ts_ms = int(ts) if len(ts) >= 13 else int(ts) * 1000
+        delta_ms = ts_ms - now_ms
         # 3. 再次检查时间，然后只提交一次
         if not lesson.window_open(now_china()):
             raise ClientError("business", "当前不在可签到时间（课前 10 分钟至课程结束）")
+        t_post = time.monotonic()
         try:
-            url = (f"{API}/app/course/stu_scan_sign.action" if variant == "vpn8347"
-                   else f"{SIGN_API}/eschool/app/course/stu_scan_sign.action")
+            url = {
+                "vpn8347": f"{API}/app/course/stu_scan_sign.action",
+                "vpn8347_eschool": f"{API}/eschool/app/course/stu_scan_sign.action",
+                "eschool": f"{SIGN_API}/eschool/app/course/stu_scan_sign.action",
+            }[variant]
             payload = self._api(
                 "POST", url,
                 params={"id": self.user_id, "courseSchedId": lesson.id, "timestamp": ts},
                 sid=self.login_name or self.session_id, retry=False)
         except ClientError as e:
             if e.kind == "business":
-                return SignResult("failed", e.message)
+                post_rtt = int((time.monotonic() - t_post) * 1000)
+                diag = (f" [ln={self.login_name_from}({len(self.login_name or '')})"
+                        f" ts={ts_port}/{len(ts)}位/Δ{delta_ms}ms/{ts_rtt}ms post={post_rtt}ms]")
+                return SignResult("failed", e.message + diag)
             return self._confirm(day, lesson_id)
         res = payload.get("result")
         if isinstance(res, dict) and str(res.get("stuSignStatus")) == "1":

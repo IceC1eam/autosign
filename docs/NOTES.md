@@ -32,10 +32,11 @@
 4. `GET` iClass `https://iclass.buaa.edu.cn:8346/?type=jumpMyCenter` → SSO（已登录）→ 带 ticket 回到 8346 → 若干 302 → 某一跳的 Location 含 `loginName=<长串>`（**不是学号**，且很长；取 `\S{1,512}`），最终 200。
 5. `GET` `https://iclass.buaa.edu.cn:8346/eschool/app/user/login_buaa.do?phone=<loginName>&verificationType=2&userLevel=1&password=&verificationUrl=` → `result.id`（参考 `fontlos/buaa-api` 与 `singledog957/duaa`）。若用学号代替 loginName，会得到 `STATUS=1`。
 6. 业务接口：所有接口统一 `POST`、`Sessionid` 请求头传 `loginName`、`id` 放在 URL 查询参数里；`STATUS=401`/`4001` 视为会话失效。
-7. **签到请求有两种写法**（`iclass.SIGN_VARIANTS`，均以 `loginName` 为 `Sessionid`、`id` 在 URL 查询参数、无表单体）：
-   - `vpn8347`（默认，参考 `fontlos/buaa-api` 的 WebVPN 模式）：`https://iclass.buaa.edu.cn:8347/app/course/stu_scan_sign.action`（无 `/eschool/` 前缀，时间戳也优先从 8347 取）；
+7. **签到请求有三种写法**（`iclass.SIGN_VARIANTS`，均以 `loginName` 为 `Sessionid`、`id` 在 URL 查询参数、无表单体）：
+   - `vpn8347`（默认，参考 `fontlos/buaa-api` 的 WebVPN 模式）：`https://iclass.buaa.edu.cn:8347/app/course/stu_scan_sign.action`（时间戳优先从 8347 取）；
+   - `vpn8347_eschool`（备选）：`https://iclass.buaa.edu.cn:8347/eschool/app/course/stu_scan_sign.action`（时间戳优先从 8347 取）；
    - `eschool`（备选，校园网直连 `duaa` 的写法）：`http://iclass.buaa.edu.cn:8081/eschool/app/course/stu_scan_sign.action`（时间戳优先从 8081 取）。
-   2026-11-24 实测经 WebVPN 调 `8081/eschool/...` 与旧 `8081/app/...` 均被学校回 `ERRCODE=101 签到失败！`，因为 `8081/eschool/` 仅校园网直连可用，WebVPN 下签到与查询均走 `8347`。调度器第 1 次用 `vpn8347`，被明确拒绝后与 `eschool` 交替并在事件里标注。
+   被明确拒绝时事件里会附带脱敏诊断（`ln=来源(长度) ts=端口/位数/Δ时钟差ms/耗时ms post=耗时ms`），不含任何凭据原值。
 
 排障方法：登录失败时，“最近动态”或 `GET /autosign/api/accounts/{id}/schedule` 的错误里带有脱敏轨迹（`方法 目标路径?[参数名] -> 状态 => 下一跳`）。对照上面流程找出哪一跳被拒/断，再决定是放行新的门户路径（加到 `PORTAL_PATHS`，要保持最小放行）还是修解析。**不要**为了省事放开任意 `d.buaa.edu.cn` 路径或任意主机。
 
